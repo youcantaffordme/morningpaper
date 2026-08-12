@@ -1,10 +1,10 @@
--- Morning Paper source pack (v0.5.0)
+-- Morning Paper source pack (v0.7.0)
 -- enabled=false keeps a source available without using it by default.
 -- limit controls how many current stories are considered from each feed.
--- max_age_hours filters dated items so stale feeds do not fill the paper.
+-- max_age_hours filters dated items so stale feeds do not fill the research packet.
 -- full_text=true means Morning Paper will attempt to fetch the public article page.
 -- agenda_only=true means a feed is used only as an editorial/topic signal for
--- the AI Intelligence Desk; its paywalled/full article is NOT copied into the paper.
+-- the AI newsroom; its paywalled/full article is NOT copied into the paper.
 
 return {
     {
