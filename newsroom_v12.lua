@@ -1,13 +1,15 @@
--- Morning Paper v0.12 — Consensus Lead Desk
+-- Morning Paper v0.12.2 — Consensus Lead Desk
 --
 -- Public headlines from major paywalled publications are agenda signals only.
--- This layer clusters those signals by event before the newsroom runs. If several
--- major publications independently emphasize the same event, that consensus is
--- promoted above a merely newer one-off lead. Hidden subscriber text is never
--- fetched, inferred, or treated as evidence.
+-- This layer clusters those signals by event before the newsroom runs. Multiple
+-- feeds from the SAME publication count only once toward consensus, so a story
+-- repeated across WSJ sections cannot masquerade as multi-outlet agreement.
+-- Hidden subscriber text is never fetched, inferred, or treated as evidence.
 
 local Base = require("newsroom_v09")
 local base_generate = Base.generate
+
+Base.CONSENSUS_LEAD_DESK_VERSION = "0.12.2"
 
 local STOP = {}
 for word in ([[
@@ -66,9 +68,26 @@ local function is_coverage_scan(item)
     return tostring(item and item.source or ""):find("[Coverage Scan]", 1, true) ~= nil
 end
 
+local CANONICAL_PUBLISHERS = {
+    "The Wall Street Journal",
+    "Bloomberg",
+    "Financial Times",
+    "The New York Times",
+    "The Washington Post",
+    "Barron's",
+    "The Economist",
+}
+
 local function publisher_name(source)
     local s = clean(source)
     s = s:gsub("%s*%[PAYWALL LEAD%]%s*$", "")
+
+    -- Canonicalize every feed belonging to the same publication. This is
+    -- especially important for the legacy WSJ World/Markets/Tech/etc. feeds.
+    for _, publisher in ipairs(CANONICAL_PUBLISHERS) do
+        if s:sub(1, #publisher) == publisher then return publisher end
+    end
+
     s = s:gsub("%s+—%s+fresh headline leads.*$", "")
     s = s:gsub("%s+%-+%s+fresh headline leads.*$", "")
     return clean(s)
@@ -100,14 +119,14 @@ local function cluster_leads(leads)
     local clusters = {}
     for _, original in ipairs(leads) do
         local lead = clone(original)
+        lead._lead_publisher = publisher_name(lead.source)
         local cluster = best_cluster(clusters, lead)
         if not cluster then
             cluster = { anchor=clean(lead.title), members={}, publishers={}, newest=0 }
             clusters[#clusters + 1] = cluster
         end
         cluster.members[#cluster.members + 1] = lead
-        local publisher = publisher_name(lead.source)
-        if publisher ~= "" then cluster.publishers[publisher] = true end
+        if lead._lead_publisher ~= "" then cluster.publishers[lead._lead_publisher] = true end
         cluster.newest = math.max(cluster.newest, tonumber(lead.published_epoch) or 0)
     end
 
@@ -117,9 +136,9 @@ local function cluster_leads(leads)
         cluster.publisher_count = publisher_count
         local age_hours = cluster.newest > 0 and math.max(0, (os.time() - cluster.newest) / 3600) or 72
         local freshness = math.max(0, 36 - age_hours)
-        -- Publisher consensus dominates. Multiple headlines from one publisher help,
-        -- but cannot outweigh several independent major publications.
-        cluster.priority_score = publisher_count * 100 + math.min(#cluster.members, 5) * 12 + freshness
+        -- Independent publisher consensus dominates; raw duplicate headline count
+        -- is intentionally not part of the score.
+        cluster.priority_score = publisher_count * 100 + freshness
     end
 
     table.sort(clusters, function(a, b)
@@ -139,21 +158,32 @@ local function prioritized_agenda(items)
     local clusters = cluster_leads(leads)
     local ordered = {}
     local consensus_clusters = 0
+    local forwarded_leads = 0
 
     for rank, cluster in ipairs(clusters) do
         if cluster.publisher_count >= 2 then consensus_clusters = consensus_clusters + 1 end
         table.sort(cluster.members, function(a, b)
             return (tonumber(a.published_epoch) or 0) > (tonumber(b.published_epoch) or 0)
         end)
+
+        -- Forward only the newest signal from each independent publisher for this
+        -- event. newsroom_v09's lead bonus therefore measures publisher consensus,
+        -- not duplicate feeds/headlines from one outlet.
+        local publisher_seen = {}
         for _, lead in ipairs(cluster.members) do
-            lead.lead_rank = rank
-            lead.lead_consensus = cluster.publisher_count
-            lead.lead_priority_score = cluster.priority_score
-            lead.agenda_category = string.format(
-                "Front Page Priority #%d · %d major publication%s",
-                rank, cluster.publisher_count, cluster.publisher_count == 1 and "" or "s"
-            )
-            ordered[#ordered + 1] = lead
+            local publisher = lead._lead_publisher ~= "" and lead._lead_publisher or publisher_name(lead.source)
+            if publisher ~= "" and not publisher_seen[publisher] then
+                publisher_seen[publisher] = true
+                lead.lead_rank = rank
+                lead.lead_consensus = cluster.publisher_count
+                lead.lead_priority_score = cluster.priority_score
+                lead.agenda_category = string.format(
+                    "Front Page Priority #%d · %d major publication%s",
+                    rank, cluster.publisher_count, cluster.publisher_count == 1 and "" or "s"
+                )
+                ordered[#ordered + 1] = lead
+                forwarded_leads = forwarded_leads + 1
+            end
         end
     end
 
@@ -162,12 +192,12 @@ local function prioritized_agenda(items)
     end)
     for _, scan in ipairs(scans) do ordered[#ordered + 1] = scan end
 
-    return ordered, #leads, #clusters, consensus_clusters
+    return ordered, #leads, forwarded_leads, #clusters, consensus_clusters
 end
 
 function Base.generate(opts)
     opts = opts or {}
-    local agenda, lead_count, lead_clusters, consensus_clusters = prioritized_agenda(opts.agenda_items or {})
+    local agenda, lead_count, forwarded_leads, lead_clusters, consensus_clusters = prioritized_agenda(opts.agenda_items or {})
 
     local forwarded = {}
     for k, v in pairs(opts) do forwarded[k] = v end
@@ -176,15 +206,20 @@ function Base.generate(opts)
     local output, err, model, count, stats = base_generate(forwarded)
     stats = stats or {}
     stats.paywall_leads_scanned = lead_count
+    stats.paywall_leads_forwarded = forwarded_leads
     stats.paywall_lead_clusters = lead_clusters
     stats.paywall_consensus_clusters = consensus_clusters
+    stats.consensus_lead_desk_version = Base.CONSENSUS_LEAD_DESK_VERSION
 
     local note = string.format(
-        "Consensus Lead Desk: %d fresh paywall signals -> %d topics; %d topics appeared across 2+ major publications.",
-        lead_count, lead_clusters, consensus_clusters
+        "Consensus Lead Desk: %d fresh signals -> %d unique publisher/event signals across %d topics; %d topics appeared across 2+ major publications.",
+        lead_count, forwarded_leads, lead_clusters, consensus_clusters
     )
     if model and not err then
-        model = tostring(model) .. string.format(" · Lead Desk %d signals/%d consensus topics", lead_count, consensus_clusters)
+        model = tostring(model) .. string.format(
+            " · Lead Desk %d raw/%d unique/%d consensus topics",
+            lead_count, forwarded_leads, consensus_clusters
+        )
     elseif err then
         err = tostring(err) .. " | " .. note
     end
