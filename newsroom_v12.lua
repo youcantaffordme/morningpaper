@@ -93,6 +93,18 @@ local function publisher_name(source)
     return clean(s)
 end
 
+local function strip_publisher_suffix(title, publisher)
+    local t = clean(title)
+    if publisher == "" then return t end
+    for _, sep in ipairs({" - ", " — ", " | "}) do
+        local suffix = sep .. publisher
+        if #t > #suffix and t:sub(-#suffix) == suffix then
+            return clean(t:sub(1, #t - #suffix))
+        end
+    end
+    return t
+end
+
 local function clone(item)
     local out = {}
     for k, v in pairs(item or {}) do out[k] = v end
@@ -102,11 +114,13 @@ end
 local function best_cluster(clusters, lead)
     local best, best_score = nil, 0
     for _, cluster in ipairs(clusters) do
-        local score = similarity(lead.title, cluster.anchor)
-        local ok = same_lead_event(lead.title, cluster.anchor)
+        local lead_title = lead._lead_match_title or lead.title
+        local score = similarity(lead_title, cluster.anchor)
+        local ok = same_lead_event(lead_title, cluster.anchor)
         for _, member in ipairs(cluster.members) do
-            local ms = similarity(lead.title, member.title)
-            if same_lead_event(lead.title, member.title) and ms > score then
+            local member_title = member._lead_match_title or member.title
+            local ms = similarity(lead_title, member_title)
+            if same_lead_event(lead_title, member_title) and ms > score then
                 score, ok = ms, true
             end
         end
@@ -120,9 +134,10 @@ local function cluster_leads(leads)
     for _, original in ipairs(leads) do
         local lead = clone(original)
         lead._lead_publisher = publisher_name(lead.source)
+        lead._lead_match_title = strip_publisher_suffix(lead.title, lead._lead_publisher)
         local cluster = best_cluster(clusters, lead)
         if not cluster then
-            cluster = { anchor=clean(lead.title), members={}, publishers={}, newest=0 }
+            cluster = { anchor=clean(lead._lead_match_title or lead.title), members={}, publishers={}, newest=0 }
             clusters[#clusters + 1] = cluster
         end
         cluster.members[#cluster.members + 1] = lead
