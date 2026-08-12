@@ -168,7 +168,7 @@ local function http_get(url)
         url=url,
         sink=ltn12.sink.table(chunks),
         headers={
-            ["User-Agent"]="KOReader MorningPaper/0.4",
+            ["User-Agent"]="KOReader MorningPaper/0.4.1",
             ["Accept"]="application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
         },
     }
@@ -320,7 +320,8 @@ function MorningPaper:openLatest()
         UIManager:show(InfoMessage:new{ text=_("No Morning Paper issue exists yet. Refresh today's paper first.") })
         return
     end
-    self.ui:onClose()
+    -- ReaderUI:showReader safely closes/switches the active KOReader reader/file manager itself.
+    -- Do not call self.ui:onClose() here: doing so tears down launcher overlays such as Bookshelf.
     require("apps/reader/readerui"):showReader(path)
 end
 
@@ -434,7 +435,9 @@ function MorningPaper:buildPaper(opts)
         UIManager:show(ConfirmBox:new{
             text=T(_("Morning Paper created with %1 stories.\n%2 full articles fetched.\nA dated newspaper cover was embedded.\n\n%3%4"), total, full_count, path, note),
             ok_text=_("Open"),
-            ok_callback=function() self.ui:onClose(); require("apps/reader/readerui"):showReader(path) end,
+            ok_callback=function()
+                require("apps/reader/readerui"):showReader(path)
+            end,
             cancel_text=_("Close"),
         })
     end
@@ -493,7 +496,7 @@ function MorningPaper:addToMainMenu(menu_items)
             {
                 text=_("About"),
                 callback=function()
-                    UIManager:show(InfoMessage:new{ text=_("Morning Paper 0.4 creates a real EPUB edition every day with an embedded newspaper-style cover, date, edition time and top headlines. It keeps newest-first ordering, clean article filtering and optional hardware-wake morning delivery. Publisher paywalls are not bypassed.") })
+                    UIManager:show(InfoMessage:new{ text=_("Morning Paper 0.4.1 creates a real EPUB edition every day with an embedded newspaper-style cover, date, edition time and top headlines. It keeps newest-first ordering, clean article filtering and optional hardware-wake morning delivery. Opening an issue now leaves launcher overlays such as Bookshelf intact. Publisher paywalls are not bypassed.") })
                 end,
             },
         },
