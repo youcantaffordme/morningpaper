@@ -1,4 +1,4 @@
--- Morning Paper v0.12.2 — Consensus Lead Desk
+-- Morning Paper v0.12.3 — Consensus Lead Desk
 --
 -- Public headlines from major paywalled publications are agenda signals only.
 -- This layer clusters those signals by event before the newsroom runs. Multiple
@@ -9,7 +9,7 @@
 local Base = require("newsroom_v09")
 local base_generate = Base.generate
 
-Base.CONSENSUS_LEAD_DESK_VERSION = "0.12.2"
+Base.CONSENSUS_LEAD_DESK_VERSION = "0.12.3"
 
 local STOP = {}
 for word in ([[
