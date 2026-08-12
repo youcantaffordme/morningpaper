@@ -29,10 +29,10 @@ end
 local named_entities = {
     amp = "&", lt = "<", gt = ">", quot = '"', apos = "'", nbsp = " ",
     ndash = "–", mdash = "—", hellip = "…", rsquo = "’", lsquo = "‘",
-    rdquo = "”", ldquo = "“", bull = "•", middot = "·",
+    rdquo = "”", ldquo = "“", bull = "•", middot = "·", copy = "©",
 }
 
-local function decode_entities(s)
+local function decode_entities_once(s)
     s = tostring(s or "")
     s = s:gsub("&#x([0-9A-Fa-f]+);", function(hex)
         return utf8_char(tonumber(hex, 16))
@@ -46,16 +46,14 @@ local function decode_entities(s)
     return s
 end
 
-local function clean_inline_html(s)
+local function decode_entities_deep(s)
+    local prev
     s = tostring(s or "")
-    s = s:gsub("<script.-</script>", " ")
-    s = s:gsub("<style.-</style>", " ")
-    s = s:gsub("<noscript.-</noscript>", " ")
-    s = s:gsub("<svg.-</svg>", " ")
-    s = s:gsub("<[^>]->", " ")
-    s = decode_entities(s)
-    s = s:gsub("%s+", " ")
-    s = s:gsub("^%s+", ""):gsub("%s+$", "")
+    for _ = 1, 4 do
+        prev = s
+        s = decode_entities_once(s)
+        if s == prev then break end
+    end
     return s
 end
 
@@ -73,10 +71,96 @@ local function remove_block(html, tag)
         end
         chunks[#chunks + 1] = html:sub(pos, s - 1)
         local e = lower:find(close_pat, s, true)
-        if not e then break end
+        if not e then
+            pos = s + #open_pat
+            break
+        end
         pos = e + #close_pat
     end
+    if pos <= #html and #chunks == 0 then chunks[#chunks + 1] = html:sub(pos) end
     return table.concat(chunks)
+end
+
+local boilerplate_phrases = {
+    "sign up for the breaking news",
+    "sign up for our newsletter",
+    "sign up to our newsletter",
+    "subscribe to our newsletter",
+    "continue reading",
+    "read more",
+    "advertisement",
+    "image source",
+    "image caption",
+    "cookie policy",
+    "privacy policy",
+    "terms and conditions",
+}
+
+local function is_boilerplate_line(line)
+    local lower = line:lower()
+    for _, phrase in ipairs(boilerplate_phrases) do
+        if lower:find(phrase, 1, true) then return true end
+    end
+    return false
+end
+
+local function strip_urls(s)
+    s = s:gsub("https?://[^%s<>'\"]+", " ")
+    s = s:gsub("www%.[^%s<>'\"]+", " ")
+    s = s:gsub("href%s*=%s*['\"][^'\"]*['\"]", " ")
+    s = s:gsub("href%s*=%s*[^%s>]+", " ")
+    return s
+end
+
+function ArticleFetcher.cleanText(input)
+    local s = tostring(input or "")
+    if s == "" then return "" end
+
+    s = s:gsub("<!%[CDATA%[(.-)%]%]>", "%1")
+    s = decode_entities_deep(s)
+    s = s:gsub("<!%-%-.-%-%->", " ")
+
+    for _, tag in ipairs({"script", "style", "noscript", "svg", "nav", "aside", "footer", "form", "button"}) do
+        s = remove_block(s, tag)
+    end
+
+    -- Preserve paragraph boundaries before deleting the remaining markup.
+    s = s:gsub("<[Bb][Rr]%s*/?>", "\n")
+    s = s:gsub("</[Pp]%s*>", "\n\n")
+    s = s:gsub("</[Ll][Ii]%s*>", "\n")
+    s = s:gsub("</[Hh][1-6]%s*>", "\n\n")
+    s = s:gsub("<[^>]->", " ")
+
+    -- Some feeds are double-encoded: removing tags can reveal another HTML layer.
+    s = decode_entities_deep(s)
+    s = s:gsub("<[Bb][Rr]%s*/?>", "\n")
+    s = s:gsub("</[Pp]%s*>", "\n\n")
+    s = s:gsub("</[Ll][Ii]%s*>", "\n")
+    s = s:gsub("</[Hh][1-6]%s*>", "\n\n")
+    s = s:gsub("<[^>]->", " ")
+    s = strip_urls(s)
+
+    local lines = {}
+    s = s:gsub("\r\n", "\n"):gsub("\r", "\n")
+    for line in (s .. "\n"):gmatch("(.-)\n") do
+        line = line:gsub("[%z\1-\8\11\12\14-\31]", " ")
+        line = line:gsub("%s+", " ")
+        line = line:gsub("^%s+", ""):gsub("%s+$", "")
+        -- Catch malformed tag fragments that survived a broken source feed.
+        line = line:gsub("^/?[a-zA-Z][a-zA-Z0-9]*%s*>", "")
+        line = line:gsub("</?[a-zA-Z][^>]*>", " ")
+        line = line:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+        if line ~= "" and not is_boilerplate_line(line) then
+            lines[#lines + 1] = line
+        elseif #lines > 0 and lines[#lines] ~= "" then
+            lines[#lines + 1] = ""
+        end
+    end
+
+    local out = table.concat(lines, "\n")
+    out = out:gsub("\n%s*\n%s*\n+", "\n\n")
+    out = out:gsub("^%s+", ""):gsub("%s+$", "")
+    return out
 end
 
 local function isolate_tag(html, tag)
@@ -93,7 +177,7 @@ end
 local function paragraphs_from_html(html)
     if not html or html == "" then return {} end
     local cleaned = html
-    for _, tag in ipairs({"script", "style", "noscript", "svg", "nav", "aside", "footer", "form"}) do
+    for _, tag in ipairs({"script", "style", "noscript", "svg", "nav", "aside", "footer", "form", "button"}) do
         cleaned = remove_block(cleaned, tag)
     end
 
@@ -107,10 +191,8 @@ local function paragraphs_from_html(html)
         if not open_end then break end
         local e = lower:find("</p>", open_end + 1, true)
         if not e then break end
-        local text = clean_inline_html(cleaned:sub(open_end + 1, e - 1))
-        if #text >= 35 then
-            paragraphs[#paragraphs + 1] = text
-        end
+        local text = ArticleFetcher.cleanText(cleaned:sub(open_end + 1, e - 1))
+        if #text >= 35 then paragraphs[#paragraphs + 1] = text end
         pos = e + 4
     end
     return paragraphs
@@ -125,8 +207,7 @@ local function json_string_value(html, key)
     if not colon then return nil end
     local quote = lower:find('"', colon + 1, true)
     if not quote then return nil end
-    local out = {}
-    local escaped = false
+    local out, escaped = {}, false
     local i = quote + 1
     while i <= #html do
         local c = html:sub(i, i)
@@ -209,19 +290,28 @@ local function request(url, redirects)
         url = url,
         sink = ltn12.sink.table(chunks),
         headers = {
-            ["User-Agent"] = "Mozilla/5.0 (KOReader MorningPaper/0.2; e-ink reader)",
+            ["User-Agent"] = "Mozilla/5.0 (KOReader MorningPaper/0.3.1; e-ink reader)",
             ["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         },
     }
     if not ok then return nil, tostring(code or status or "request failed"), url end
     code = tonumber(code) or 0
-    if code >= 300 and code < 400 and redirects < 3 and headers then
+    if code >= 300 and code < 400 and redirects < 4 and headers then
         local location = headers.location or headers.Location
         local next_url = resolve_redirect(url, location)
         if next_url then return request(next_url, redirects + 1) end
     end
     if code >= 400 then return nil, "HTTP " .. tostring(code), url end
     return table.concat(chunks), nil, url
+end
+
+local function good_article_text(text, min_chars)
+    if not text or #text < min_chars then return false end
+    if text:find("<", 1, true) or text:find(">", 1, true) then return false end
+    local url_count = 0
+    for _ in text:gmatch("https?://") do url_count = url_count + 1 end
+    if url_count > 1 then return false end
+    return true
 end
 
 function ArticleFetcher.extract(html, min_chars)
@@ -231,21 +321,20 @@ function ArticleFetcher.extract(html, min_chars)
 
     local json_body = json_string_value(html, "articleBody")
     if json_body then
-        json_body = decode_entities(json_body):gsub("%s+", " ")
-        if #json_body >= min_chars then
-            return json_body, "json-ld"
-        end
+        json_body = ArticleFetcher.cleanText(json_body)
+        if good_article_text(json_body, min_chars) then return json_body, "json-ld" end
     end
 
     local candidate = isolate_tag(html, "article") or isolate_tag(html, "main")
     local paragraphs = paragraphs_from_html(candidate or html)
     local text = join_paragraphs(paragraphs)
-    if text and #text >= min_chars then
+    if text then text = ArticleFetcher.cleanText(text) end
+    if good_article_text(text, min_chars) then
         return text, candidate and "article" or "paragraphs"
     end
 
     if looks_paywalled(html) then return nil, "publisher limited this article" end
-    return nil, "full text not found"
+    return nil, "clean full text not found"
 end
 
 function ArticleFetcher.fetch(url, opts)
@@ -255,7 +344,7 @@ function ArticleFetcher.fetch(url, opts)
     if not html then return nil, err, final_url end
     local text, mode = ArticleFetcher.extract(html, opts.min_chars or 350)
     if not text then return nil, mode, final_url end
-    return text, mode, final_url
+    return ArticleFetcher.cleanText(text), mode, final_url
 end
 
 return ArticleFetcher
