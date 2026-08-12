@@ -2,12 +2,14 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local UIManager = require("ui/uimanager")
 local InfoMessage = require("ui/widget/infomessage")
 local ConfirmBox = require("ui/widget/confirmbox")
+local InputDialog = require("ui/widget/inputdialog")
 local NetworkMgr = require("ui/network/manager")
 local DataStorage = require("datastorage")
 local Device = require("device")
 local lfs = require("libs/libkoreader-lfs")
 local ArticleFetcher = require("article_fetcher")
 local EpubBuilder = require("epub_builder")
+local AiBriefing = require("ai_briefing")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
@@ -22,7 +24,7 @@ local MONTHS = {
 }
 
 local SECTION_ORDER = {
-    "Front Page", "World", "U.S.", "Business & Markets",
+    "Intelligence Desk", "Front Page", "World", "U.S.", "Business & Markets",
     "Technology & AI", "Science", "Culture",
 }
 
@@ -168,7 +170,7 @@ local function http_get(url)
         url=url,
         sink=ltn12.sink.table(chunks),
         headers={
-            ["User-Agent"]="KOReader MorningPaper/0.4.1",
+            ["User-Agent"]="KOReader MorningPaper/0.5.0",
             ["Accept"]="application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
         },
     }
@@ -212,6 +214,11 @@ function MorningPaper:init()
     self.last_auto_status = G_reader_settings:readSetting("morningpaper_last_auto_status", "Never run")
     self.auto_callback = function() self:onAutoDeliveryWake() end
 
+    self.ai_enabled = G_reader_settings:readSetting("morningpaper_ai_enabled", true)
+    self.ai_api_key = G_reader_settings:readSetting("morningpaper_openrouter_key", "")
+    self.ai_model = G_reader_settings:readSetting("morningpaper_ai_model", AiBriefing.DEFAULT_MODEL)
+    self.last_ai_status = G_reader_settings:readSetting("morningpaper_last_ai_status", "Not run yet")
+
     if self.auto_enabled then self:scheduleAutoDelivery(true) end
     self.ui.menu:registerToMainMenu(self)
 end
@@ -221,6 +228,14 @@ function MorningPaper:saveAutoSettings()
     G_reader_settings:saveSetting("morningpaper_auto_hour", self.auto_hour)
     G_reader_settings:saveSetting("morningpaper_auto_minute", self.auto_minute)
     G_reader_settings:saveSetting("morningpaper_last_auto_status", self.last_auto_status)
+    G_reader_settings:flush()
+end
+
+function MorningPaper:saveAISettings()
+    G_reader_settings:saveSetting("morningpaper_ai_enabled", self.ai_enabled)
+    G_reader_settings:saveSetting("morningpaper_openrouter_key", self.ai_api_key or "")
+    G_reader_settings:saveSetting("morningpaper_ai_model", self.ai_model or AiBriefing.DEFAULT_MODEL)
+    G_reader_settings:saveSetting("morningpaper_last_ai_status", self.last_ai_status or "Unknown")
     G_reader_settings:flush()
 end
 
@@ -263,6 +278,53 @@ function MorningPaper:autoStatusText()
     local delivery = os.date("%I:%M %p", os.time{year=2000, month=1, day=1, hour=self.auto_hour, min=self.auto_minute, sec=0}):gsub("^0", "")
     local next_text = self.auto_next_epoch and os.date("%a %b %d, %I:%M %p", self.auto_next_epoch):gsub(" 0", " ") or "Not scheduled"
     return string.format("Auto delivery: %s\nDelivery time: %s\nNext delivery: %s\nLast result: %s", enabled, delivery, next_text, self.last_auto_status or "Unknown")
+end
+
+function MorningPaper:aiStatusText()
+    local _, key_source = AiBriefing.findOpenRouterKey(self.ai_api_key)
+    return string.format(
+        "AI Intelligence Desk: %s\nModel: %s\nAPI key: %s\nLast result: %s\n\nThe AI receives short excerpts from the public reporting Morning Paper already fetched. WSJ feeds are used only as headline/topic signals, not as hidden paywalled article text.",
+        self.ai_enabled and "ON" or "OFF",
+        self.ai_model or AiBriefing.DEFAULT_MODEL,
+        key_source,
+        self.last_ai_status or "Unknown"
+    )
+end
+
+function MorningPaper:setAIEnabled(enabled)
+    self.ai_enabled = enabled and true or false
+    self.last_ai_status = self.ai_enabled and "Enabled; waiting for next refresh" or "Disabled"
+    self:saveAISettings()
+end
+
+function MorningPaper:promptForOpenRouterKey()
+    local dialog
+    dialog = InputDialog:new{
+        title=_("OpenRouter API key"),
+        input=self.ai_api_key or "",
+        input_hint="sk-or-v1-…",
+        description=_("Optional. Morning Paper will also try to reuse an OpenRouter key already configured in KOAssistant. The default AI model is OpenRouter's free router."),
+        buttons={
+            {
+                {
+                    text=_("Cancel"),
+                    callback=function() UIManager:close(dialog) end,
+                },
+                {
+                    text=_("Save"),
+                    callback=function()
+                        self.ai_api_key = dialog:getInputText() or ""
+                        self.ai_enabled = true
+                        self.last_ai_status = "API key saved; waiting for next refresh"
+                        self:saveAISettings()
+                        UIManager:close(dialog)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
 end
 
 function MorningPaper:onAutoDeliveryWake()
@@ -338,6 +400,7 @@ function MorningPaper:buildPaper(opts)
     local edition_time = os.date("%I:%M %p", issue_epoch):gsub("^0", "")
 
     local sections, seen, failures = {}, {}, {}
+    local agenda_items, agenda_seen = {}, {}
     local total, full_count, excerpt_count, stale_count = 0, 0, 0, 0
     local article_counter = 0
 
@@ -349,46 +412,62 @@ function MorningPaper:buildPaper(opts)
             else
                 local items = parse_rss(xml, src.limit or 3)
                 if #items == 0 then items = parse_atom(xml, src.limit or 3) end
-                sections[src.section] = sections[src.section] or {}
 
-                for _, item in ipairs(items) do
-                    local key = normalize_title(item.title)
-                    if not is_fresh(item.date, src.max_age_hours) then
-                        stale_count = stale_count + 1
-                    elseif key ~= "" and not seen[key] then
-                        seen[key] = true
-                        item.source = src.name
-                        item.published_epoch = parse_date_epoch(item.date) or 0
-                        item.content_mode = "Feed excerpt"
-                        item.body = ArticleFetcher.cleanText(item.description)
+                if src.agenda_only then
+                    for _, item in ipairs(items) do
+                        local key = normalize_title(item.title)
+                        if not is_fresh(item.date, src.max_age_hours) then
+                            stale_count = stale_count + 1
+                        elseif key ~= "" and not agenda_seen[key] then
+                            agenda_seen[key] = true
+                            item.source = src.name
+                            item.agenda_category = src.agenda_category or "WSJ"
+                            item.published_epoch = parse_date_epoch(item.date) or 0
+                            agenda_items[#agenda_items + 1] = item
+                        end
+                    end
+                else
+                    sections[src.section] = sections[src.section] or {}
 
-                        if src.full_text ~= false and item.link ~= "" then
-                            local body, mode, final_url = ArticleFetcher.fetch(item.link, {min_chars=src.min_fulltext_chars or 350})
-                            if body and body ~= "" then
-                                item.body = ArticleFetcher.cleanText(body)
-                                item.content_mode = "Full article"
-                                item.extract_mode = mode
-                                item.link = final_url or item.link
-                                full_count = full_count + 1
+                    for _, item in ipairs(items) do
+                        local key = normalize_title(item.title)
+                        if not is_fresh(item.date, src.max_age_hours) then
+                            stale_count = stale_count + 1
+                        elseif key ~= "" and not seen[key] then
+                            seen[key] = true
+                            item.source = src.name
+                            item.published_epoch = parse_date_epoch(item.date) or 0
+                            item.content_mode = "Feed excerpt"
+                            item.body = ArticleFetcher.cleanText(item.description)
+
+                            if src.full_text ~= false and item.link ~= "" then
+                                local body, mode, final_url = ArticleFetcher.fetch(item.link, {min_chars=src.min_fulltext_chars or 350})
+                                if body and body ~= "" then
+                                    item.body = ArticleFetcher.cleanText(body)
+                                    item.content_mode = "Full article"
+                                    item.extract_mode = mode
+                                    item.link = final_url or item.link
+                                    full_count = full_count + 1
+                                else
+                                    item.extract_error = mode
+                                    excerpt_count = excerpt_count + 1
+                                end
                             else
-                                item.extract_error = mode
                                 excerpt_count = excerpt_count + 1
                             end
-                        else
-                            excerpt_count = excerpt_count + 1
-                        end
 
-                        -- Final safety pass: never let raw markup, giant hrefs or tracking URLs into the edition.
-                        item.body = ArticleFetcher.cleanText(item.body)
-                        if item.body == "" or #item.body < 60 then
-                            item.body = "A clean full-text copy was not available from this publisher. Use “Open original article” below to read it on the source site."
-                            item.content_mode = "Source link only"
-                        end
+                            -- Final safety pass: never let raw markup, giant hrefs or tracking URLs into the edition.
+                            item.body = ArticleFetcher.cleanText(item.body)
+                            if item.body == "" or #item.body < 60 then
+                                item.body = "A clean full-text copy was not available from this publisher. Use “Open original article” below to read it on the source site."
+                                item.content_mode = "Source link only"
+                            end
 
-                        sections[src.section][#sections[src.section] + 1] = item
-                        total = total + 1
-                        article_counter = article_counter + 1
-                        if article_counter % 4 == 0 then collectgarbage("collect") end
+                            sections[src.section][#sections[src.section] + 1] = item
+                            total = total + 1
+                            article_counter = article_counter + 1
+                            if article_counter % 4 == 0 then collectgarbage("collect") end
+                        end
                     end
                 end
             end
@@ -404,6 +483,35 @@ function MorningPaper:buildPaper(opts)
                 return ae > be
             end)
         end
+    end
+    table.sort(agenda_items, function(a, b) return (a.published_epoch or 0) > (b.published_epoch or 0) end)
+
+    local ai_count = 0
+    if self.ai_enabled then
+        local ai_key, key_source = AiBriefing.findOpenRouterKey(self.ai_api_key)
+        if ai_key then
+            local briefs, ai_err, model_used = AiBriefing.generate{
+                api_key=ai_key,
+                model=self.ai_model,
+                sections=sections,
+                section_order=SECTION_ORDER,
+                agenda_items=agenda_items,
+                date=issue_date,
+                nice_date=nice_date,
+                edition_time=edition_time,
+            }
+            if briefs and #briefs > 0 then
+                sections["Intelligence Desk"] = briefs
+                ai_count = #briefs
+                self.last_ai_status = string.format("Built %d briefs via %s (%s)", ai_count, tostring(model_used or self.ai_model), key_source)
+            else
+                self.last_ai_status = "AI synthesis failed: " .. tostring(ai_err)
+                failures[#failures + 1] = "AI Intelligence Desk: " .. tostring(ai_err)
+            end
+        else
+            self.last_ai_status = "Enabled, but no OpenRouter key was found"
+        end
+        self:saveAISettings()
     end
 
     local path = self.output_dir .. "/Morning Paper " .. issue_date .. ".epub"
@@ -430,10 +538,13 @@ function MorningPaper:buildPaper(opts)
 
     if not opts.automatic then
         local note = ""
+        if ai_count > 0 then note = note .. "\n" .. ai_count .. " Intelligence Desk syntheses added." end
+        if #agenda_items > 0 then note = note .. "\n" .. #agenda_items .. " fresh WSJ agenda headlines considered." end
+        if self.ai_enabled and ai_count == 0 then note = note .. "\nAI Desk: " .. tostring(self.last_ai_status) end
         if stale_count > 0 then note = note .. "\n" .. stale_count .. " stale feed entries skipped." end
-        if #failures > 0 then note = note .. "\n" .. #failures .. " source feeds had errors." end
+        if #failures > 0 then note = note .. "\n" .. #failures .. " source/AI steps had errors." end
         UIManager:show(ConfirmBox:new{
-            text=T(_("Morning Paper created with %1 stories.\n%2 full articles fetched.\nA dated newspaper cover was embedded.\n\n%3%4"), total, full_count, path, note),
+            text=T(_("Morning Paper created with %1 source stories.\n%2 full articles fetched.\nA dated newspaper cover was embedded.\n\n%3%4"), total, full_count, path, note),
             ok_text=_("Open"),
             ok_callback=function()
                 require("apps/reader/readerui"):showReader(path)
@@ -449,7 +560,8 @@ function MorningPaper:showSources()
     local lines = {}
     for _, src in ipairs(self.sources) do
         local state = src.enabled == false and "OFF" or "ON"
-        lines[#lines + 1] = string.format("[%s] %s — %s\n%s", state, src.section, src.name, src.url)
+        local role = src.agenda_only and "AGENDA ONLY" or src.section
+        lines[#lines + 1] = string.format("[%s] %s — %s\n%s", state, role, src.name, src.url)
     end
     UIManager:show(InfoMessage:new{ text=table.concat(lines, "\n\n") })
 end
@@ -485,6 +597,35 @@ function MorningPaper:addToMainMenu(menu_items)
         callback=function() UIManager:show(InfoMessage:new{ text=self:autoStatusText() }) end,
     }
 
+    local ai_submenu = {
+        {
+            text=_("Enable AI Intelligence Desk"),
+            checked_func=function() return self.ai_enabled end,
+            callback=function()
+                self:setAIEnabled(not self.ai_enabled)
+                UIManager:show(InfoMessage:new{ text=self:aiStatusText() })
+            end,
+        },
+        {
+            text=_("Set OpenRouter API key"),
+            callback=function() self:promptForOpenRouterKey() end,
+        },
+        {
+            text=_("Clear Morning Paper API key"),
+            callback=function()
+                self.ai_api_key = ""
+                self.last_ai_status = "Morning Paper key cleared; KOAssistant key will still be reused if available"
+                self:saveAISettings()
+                UIManager:show(InfoMessage:new{ text=self:aiStatusText() })
+            end,
+        },
+        {
+            text=_("AI status"),
+            separator=true,
+            callback=function() UIManager:show(InfoMessage:new{ text=self:aiStatusText() }) end,
+        },
+    }
+
     menu_items.morning_paper = {
         text=_("Morning Paper"),
         sorting_hint="tools",
@@ -492,11 +633,12 @@ function MorningPaper:addToMainMenu(menu_items)
             { text=_("Refresh today's paper"), callback=function() NetworkMgr:runWhenOnline(function() self:buildPaper() end) end },
             { text=_("Open latest paper"), callback=function() self:openLatest() end },
             { text=_("Automatic delivery"), sub_item_table=auto_submenu },
+            { text=_("AI Intelligence Desk"), sub_item_table=ai_submenu },
             { text=_("Sources"), callback=function() self:showSources() end },
             {
                 text=_("About"),
                 callback=function()
-                    UIManager:show(InfoMessage:new{ text=_("Morning Paper 0.4.1 creates a real EPUB edition every day with an embedded newspaper-style cover, date, edition time and top headlines. It keeps newest-first ordering, clean article filtering and optional hardware-wake morning delivery. Opening an issue now leaves launcher overlays such as Bookshelf intact. Publisher paywalls are not bypassed.") })
+                    UIManager:show(InfoMessage:new{ text=_("Morning Paper 0.5 adds an optional AI Intelligence Desk. It synthesizes the public reporting already fetched from multiple viewpoints, uses fresh WSJ headlines only as agenda/topic signals, distinguishes facts from contested interpretations, and keeps the original source articles in later sections. It never reconstructs or bypasses paywalled WSJ articles. Automatic delivery, EPUB covers, article sanitation, and Bookshelf-safe opening remain enabled.") })
                 end,
             },
         },
