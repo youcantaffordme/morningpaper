@@ -1,575 +1,360 @@
-local WidgetContainer = require("ui/widget/container/widgetcontainer")
+-- Morning Paper v0.12.4 compatibility runtime.
+--
+-- IMPORTANT: this is intentionally the file older Morning Paper entrypoints
+-- already require. The proven v0.7 implementation lives in main_core_v07.lua;
+-- this module upgrades that exact class in-place with current source injection,
+-- consensus newsroom routing, delivery cadence, and runtime diagnostics.
+
 local UIManager = require("ui/uimanager")
 local InfoMessage = require("ui/widget/infomessage")
-local ConfirmBox = require("ui/widget/confirmbox")
-local InputDialog = require("ui/widget/inputdialog")
-local NetworkMgr = require("ui/network/manager")
-local DataStorage = require("datastorage")
 local Device = require("device")
-local lfs = require("libs/libkoreader-lfs")
-local ArticleFetcher = require("article_fetcher")
-local EpubBuilder = require("epub_builder_v07")
-local Newsroom = require("newsroom_v07")
 local _ = require("gettext")
 
-local MorningPaper = WidgetContainer:extend{
-    name = "morningpaper",
-    is_doc_only = false,
+local RUNTIME_BUILD = "0.12.4"
+
+-- Load the current newsroom stack BEFORE the old core captures newsroom_v07.
+-- newsroom_v12 ultimately mutates/returns the same base newsroom table, so the
+-- old core's require("newsroom_v07") receives the upgraded implementation.
+local newsroom_ok, Newsroom = pcall(require, "newsroom_v12")
+local newsroom_error = newsroom_ok and nil or tostring(Newsroom)
+
+-- Expand the actual sources table the legacy core already consumes.
+local sources_ok, sources = pcall(require, "sources")
+local scans_ok, scans = pcall(require, "coverage_scans")
+local leads_ok, leads = pcall(require, "lead_network")
+
+local function append_unique(target, extras)
+    if type(target) ~= "table" or type(extras) ~= "table" then return 0 end
+    local seen = {}
+    for _, item in ipairs(target) do
+        local key = tostring(item and item.url or "") .. "\0" .. tostring(item and item.name or "")
+        seen[key] = true
+    end
+    local added = 0
+    for _, item in ipairs(extras) do
+        local key = tostring(item and item.url or "") .. "\0" .. tostring(item and item.name or "")
+        if not seen[key] then
+            target[#target + 1] = item
+            seen[key] = true
+            added = added + 1
+        end
+    end
+    return added
+end
+
+local injected_scans = (sources_ok and scans_ok) and append_unique(sources, scans) or 0
+local injected_leads = (sources_ok and leads_ok) and append_unique(sources, leads) or 0
+
+local configured_scans, configured_leads = 0, 0
+if sources_ok and type(sources) == "table" then
+    for _, src in ipairs(sources) do
+        if src and src.agenda_only then
+            if tostring(src.name or ""):find("[Coverage Scan]", 1, true) then
+                configured_scans = configured_scans + 1
+            else
+                configured_leads = configured_leads + 1
+            end
+        end
+    end
+end
+
+local Core = require("main_core_v07")
+
+local core_init = Core.init
+local core_save_auto = Core.saveAutoSettings
+local core_add_menu = Core.addToMainMenu
+
+local CADENCE_LABELS = {
+    daily = "Every morning",
+    weekdays = "Weekdays",
+    weekly = "Once a week",
+    manual = "Manual only",
 }
 
-local MONTHS = {
-    Jan=1, Feb=2, Mar=3, Apr=4, May=5, Jun=6,
-    Jul=7, Aug=8, Sep=9, Oct=10, Nov=11, Dec=12,
+local DAYS = {
+    { label="Sunday", wday=1 },
+    { label="Monday", wday=2 },
+    { label="Tuesday", wday=3 },
+    { label="Wednesday", wday=4 },
+    { label="Thursday", wday=5 },
+    { label="Friday", wday=6 },
+    { label="Saturday", wday=7 },
 }
 
-local NEWS_SECTIONS = {
-    "Front Page", "World", "U.S.", "Business & Markets",
-    "Technology & AI", "Science", "Culture",
-}
-local PUBLISH_ORDER = {
-    "Front Page", "World", "U.S.", "Business & Markets",
-    "Technology & AI", "Science", "Culture", "Sources & Further Reading",
-}
 local DELIVERY_TIMES = {
-    { label="5:30 AM", hour=5, minute=30 }, { label="6:00 AM", hour=6, minute=0 },
-    { label="6:30 AM", hour=6, minute=30 }, { label="7:00 AM", hour=7, minute=0 },
-    { label="7:30 AM", hour=7, minute=30 }, { label="8:00 AM", hour=8, minute=0 },
+    { label="5:30 AM", hour=5, minute=30 },
+    { label="6:00 AM", hour=6, minute=0 },
+    { label="6:30 AM", hour=6, minute=30 },
+    { label="7:00 AM", hour=7, minute=0 },
+    { label="7:30 AM", hour=7, minute=30 },
+    { label="8:00 AM", hour=8, minute=0 },
 }
 
-local function safe_mkdir(path)
-    if lfs.attributes(path, "mode") ~= "directory" then pcall(lfs.mkdir, path) end
+local function valid_cadence(value)
+    return value == "daily" or value == "weekdays" or value == "weekly" or value == "manual"
 end
 
-local function raw_tag(block, name)
-    local value = block:match("<" .. name .. "[^>]*>(.-)</" .. name .. ">")
-    if not value then return "" end
-    return value:gsub("<!%[CDATA%[(.-)%]%]>", "%1")
+local function day_is_allowed(epoch, cadence, weekly_wday)
+    local wday = os.date("*t", epoch).wday
+    if cadence == "daily" then return true end
+    if cadence == "weekdays" then return wday >= 2 and wday <= 6 end
+    if cadence == "weekly" then return wday == weekly_wday end
+    return false
 end
 
-local function clean_tag(block, name)
-    return ArticleFetcher.cleanText(raw_tag(block, name))
-end
-
-local function decode_link(s)
-    s = tostring(s or ""):gsub("<!%[CDATA%[(.-)%]%]>", "%1")
-    for _i = 1, 3 do
-        local before = s
-        s = s:gsub("&amp;", "&"):gsub("&#38;", "&"):gsub("&quot;", '"'):gsub("&#39;", "'")
-        if s == before then break end
-    end
-    return s:gsub("^%s+", ""):gsub("%s+$", "")
-end
-
-local function parse_rss(xml, limit)
-    local out = {}
-    for item in xml:gmatch("<item.-</item>") do
-        local title = clean_tag(item, "title")
-        local link = decode_link(raw_tag(item, "link"))
-        local desc = ArticleFetcher.cleanText(raw_tag(item, "description"))
-        if desc == "" then desc = ArticleFetcher.cleanText(raw_tag(item, "content:encoded")) end
-        local date = clean_tag(item, "pubDate")
-        if title ~= "" then
-            out[#out + 1] = { title=title, link=link, description=desc, date=date }
-            if #out >= limit then break end
+local function next_delivery_epoch(hour, minute, cadence, weekly_wday)
+    if cadence == "manual" then return nil end
+    local now = os.time()
+    local today = os.date("*t", now)
+    for offset = 0, 14 do
+        local target = os.time{
+            year=today.year,
+            month=today.month,
+            day=today.day + offset,
+            hour=hour,
+            min=minute,
+            sec=0,
+        }
+        if target > now + 30 and day_is_allowed(target, cadence, weekly_wday) then
+            return target
         end
     end
-    return out
-end
-
-local function parse_atom(xml, limit)
-    local out = {}
-    for entry in xml:gmatch("<entry.-</entry>") do
-        local title = clean_tag(entry, "title")
-        local summary = ArticleFetcher.cleanText(raw_tag(entry, "summary"))
-        if summary == "" then summary = ArticleFetcher.cleanText(raw_tag(entry, "content")) end
-        local link = entry:match("<link[^>]-href=\"(.-)\"") or entry:match("<link[^>]-href='(.-)'") or ""
-        if title ~= "" then
-            out[#out + 1] = { title=title, link=decode_link(link), description=summary, date=clean_tag(entry, "updated") }
-            if #out >= limit then break end
-        end
-    end
-    return out
-end
-
-local function normalize_title(s)
-    return tostring(s or ""):lower():gsub("[%p%c]", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-end
-
-local function local_utc_offset(epoch)
-    epoch = epoch or os.time()
-    return os.difftime(os.time(os.date("*t", epoch)), os.time(os.date("!*t", epoch)))
-end
-
-local function parse_zone_offset(zone)
-    if not zone or zone == "" then return nil end
-    zone = zone:upper()
-    if zone == "GMT" or zone == "UTC" or zone == "UT" or zone == "Z" then return 0 end
-    local sign, hh, mm = zone:match("^([%+%-])(%d%d)(%d%d)$")
-    if not sign then return nil end
-    local seconds = tonumber(hh) * 3600 + tonumber(mm) * 60
-    return sign == "-" and -seconds or seconds
-end
-
-local function make_epoch(year, mon, day, hour, min, sec, zone)
-    local naive = os.time{year=tonumber(year), month=tonumber(mon), day=tonumber(day), hour=tonumber(hour) or 0, min=tonumber(min) or 0, sec=tonumber(sec) or 0}
-    if not naive then return nil end
-    local zone_offset = parse_zone_offset(zone)
-    if zone_offset ~= nil then return naive + local_utc_offset(naive) - zone_offset end
-    return naive
-end
-
-local function parse_date_epoch(s)
-    if not s or s == "" then return nil end
-    local day, mon, year, hour, min, sec, zone = s:match("(%d%d?)%s+(%a%a%a)%s+(%d%d%d%d)%s+(%d%d):(%d%d):(%d%d)%s*([%+%-]%d%d%d%d)")
-    if not day then day, mon, year, hour, min, sec, zone = s:match("(%d%d?)%s+(%a%a%a)%s+(%d%d%d%d)%s+(%d%d):(%d%d):(%d%d)%s*(%a+)") end
-    if day and MONTHS[mon] then return make_epoch(year, MONTHS[mon], day, hour, min, sec, zone) end
-
-    year, mon, day, hour, min, sec, zone = s:match("(%d%d%d%d)%-(%d%d)%-(%d%d)[T%s](%d%d):(%d%d):(%d%d)([Zz])")
-    if year then return make_epoch(year, mon, day, hour, min, sec, zone) end
-    local zhour, zmin
-    year, mon, day, hour, min, sec, zhour, zmin = s:match("(%d%d%d%d)%-(%d%d)%-(%d%d)[T%s](%d%d):(%d%d):(%d%d)([%+%-]%d%d):?(%d%d)")
-    if year then return make_epoch(year, mon, day, hour, min, sec, zhour .. zmin) end
-    year, mon, day, hour, min, sec = s:match("(%d%d%d%d)%-(%d%d)%-(%d%d)[T%s](%d%d):(%d%d):?(%d%d?)")
-    if year then return make_epoch(year, mon, day, hour, min, sec, nil) end
-    year, mon, day = s:match("(%d%d%d%d)%-(%d%d)%-(%d%d)")
-    if year then return make_epoch(year, mon, day, 12, 0, 0, nil) end
     return nil
 end
 
-local function is_fresh(date_text, max_age_hours)
-    if not max_age_hours then return true end
-    local published = parse_date_epoch(date_text)
-    if not published then return true end
-    local age_hours = (os.time() - published) / 3600
-    return age_hours <= max_age_hours and age_hours >= -48
-end
-
-local function http_get(url)
-    local http = require("socket.http")
-    local ltn12 = require("ltn12")
-    local chunks = {}
-    http.TIMEOUT = 12
-    local ok, code, headers, status = http.request{
-        url=url,
-        sink=ltn12.sink.table(chunks),
-        headers={
-            ["User-Agent"]="KOReader MorningPaper/0.7.0",
-            ["Accept"]="application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
-        },
-    }
-    if not ok then return nil, tostring(code or status or "request failed") end
-    code = tonumber(code) or 0
-    if code >= 300 and code < 400 and headers and (headers.location or headers.Location) then return nil, "feed redirected; update its URL" end
-    if code >= 400 then return nil, "HTTP " .. tostring(code) end
-    return table.concat(chunks), nil
-end
-
-local function seconds_until(hour, minute)
-    local now = os.time()
-    local t = os.date("*t", now)
-    local target = os.time{year=t.year, month=t.month, day=t.day, hour=hour, min=minute, sec=0}
-    if target <= now + 30 then target = target + 24 * 60 * 60 end
-    return math.max(60, target - now), target
-end
-
-local function count_newsroom(sections)
-    local n, active = 0, 0
-    for _, section in ipairs(NEWS_SECTIONS) do
-        local c = #(sections[section] or {})
-        n = n + c
-        if c > 0 then active = active + 1 end
+function Core:init()
+    local stored = G_reader_settings:readSetting("morningpaper_auto_cadence", nil)
+    if not valid_cadence(stored) then
+        stored = G_reader_settings:readSetting("morningpaper_auto_enabled", false) and "daily" or "manual"
     end
-    return n, active
+    self.auto_cadence = stored
+    self.auto_weekly_wday = tonumber(G_reader_settings:readSetting("morningpaper_auto_weekly_wday", 1)) or 1
+    if self.auto_weekly_wday < 1 or self.auto_weekly_wday > 7 then self.auto_weekly_wday = 1 end
+    self.runtime_build = RUNTIME_BUILD
+
+    core_init(self)
+
+    self.auto_enabled = self.auto_cadence ~= "manual"
+    self:saveAutoSettings()
+    self:scheduleAutoDelivery(true)
 end
 
-local function make_source_appendix(research_sections, agenda_items)
-    local appendix = {}
-    for _, section in ipairs(NEWS_SECTIONS) do
-        for _, item in ipairs(research_sections[section] or {}) do
-            appendix[#appendix + 1] = {
-                title=item.title, toc_title=item.title, source=item.source or "Source", date=item.date or "",
-                published_epoch=item.published_epoch or 0, research_section=section,
-                content_mode="Newsroom source reference", body="", link=item.link or "", toc_exclude=true,
-            }
-        end
-    end
-    for _, item in ipairs(agenda_items or {}) do
-        appendix[#appendix + 1] = {
-            title=item.title, toc_title=item.title, source=item.source or "Wall Street Journal", date=item.date or "",
-            published_epoch=item.published_epoch or 0, research_section="WSJ Agenda Signals",
-            content_mode="Public agenda/headline signal only", body="", link=item.link or "", toc_exclude=true,
-        }
-    end
-    return appendix
-end
-
-local function configured_model_label(model)
-    if model == Newsroom.FOLLOW_MODEL then return "Follow KOAssistant" end
-    if model == Newsroom.FREE_MODEL then return "OpenRouter Free" end
-    if model == Newsroom.SONNET5_MODEL then return "Claude Sonnet 5" end
-    return tostring(model or Newsroom.DEFAULT_MODEL)
-end
-
-function MorningPaper:init()
-    local ok, sources = pcall(require, "sources")
-    if ok and type(sources) == "table" then self.sources = sources else self.sources, self.sources_error = {}, tostring(sources) end
-
-    self.output_dir = "/mnt/us/documents/Morning Paper"
-    if lfs.attributes("/mnt/us/documents", "mode") ~= "directory" then self.output_dir = DataStorage:getDataDir() .. "/Morning Paper" end
-    safe_mkdir(self.output_dir)
-
-    self.auto_enabled = G_reader_settings:readSetting("morningpaper_auto_enabled", false)
-    self.auto_hour = G_reader_settings:readSetting("morningpaper_auto_hour", 6)
-    self.auto_minute = G_reader_settings:readSetting("morningpaper_auto_minute", 30)
-    self.last_auto_status = G_reader_settings:readSetting("morningpaper_last_auto_status", "Never run")
-    self.auto_callback = function() self:onAutoDeliveryWake() end
-
-    self.ai_enabled = G_reader_settings:readSetting("morningpaper_ai_enabled", true)
-    self.ai_api_key = G_reader_settings:readSetting("morningpaper_openrouter_key", "")
-    self.ai_model = G_reader_settings:readSetting("morningpaper_ai_model_v07", nil)
-    if not self.ai_model or self.ai_model == "" then self.ai_model = Newsroom.FOLLOW_MODEL end
-    self.last_ai_status = G_reader_settings:readSetting("morningpaper_last_ai_status", "Not run yet")
-    self.last_ai_cost = G_reader_settings:readSetting("morningpaper_last_ai_cost", nil)
-
-    self:saveAISettings()
-    if self.auto_enabled then self:scheduleAutoDelivery(true) end
-    self.ui.menu:registerToMainMenu(self)
-end
-
-function MorningPaper:saveAutoSettings()
-    G_reader_settings:saveSetting("morningpaper_auto_enabled", self.auto_enabled)
-    G_reader_settings:saveSetting("morningpaper_auto_hour", self.auto_hour)
-    G_reader_settings:saveSetting("morningpaper_auto_minute", self.auto_minute)
-    G_reader_settings:saveSetting("morningpaper_last_auto_status", self.last_auto_status)
+function Core:saveAutoSettings()
+    core_save_auto(self)
+    G_reader_settings:saveSetting("morningpaper_auto_cadence", self.auto_cadence or "manual")
+    G_reader_settings:saveSetting("morningpaper_auto_weekly_wday", self.auto_weekly_wday or 1)
+    G_reader_settings:saveSetting("morningpaper_runtime_build", RUNTIME_BUILD)
     G_reader_settings:flush()
 end
 
-function MorningPaper:saveAISettings()
-    G_reader_settings:saveSetting("morningpaper_ai_enabled", self.ai_enabled)
-    G_reader_settings:saveSetting("morningpaper_openrouter_key", self.ai_api_key or "")
-    G_reader_settings:saveSetting("morningpaper_ai_model_v07", self.ai_model or Newsroom.DEFAULT_MODEL)
-    G_reader_settings:saveSetting("morningpaper_last_ai_status", self.last_ai_status or "Unknown")
-    if self.last_ai_cost ~= nil then G_reader_settings:saveSetting("morningpaper_last_ai_cost", self.last_ai_cost) end
-    G_reader_settings:flush()
-end
+function Core:scheduleAutoDelivery(remove_existing)
+    if not Device.wakeup_mgr then
+        self.auto_next_epoch = nil
+        return false
+    end
+    if remove_existing ~= false and self.auto_callback then
+        pcall(function() Device.wakeup_mgr:removeTasks(nil, self.auto_callback) end)
+    end
 
-function MorningPaper:scheduleAutoDelivery(remove_existing)
-    if not Device.wakeup_mgr then self.auto_next_epoch = nil; return false end
-    if remove_existing ~= false and self.auto_callback then pcall(function() Device.wakeup_mgr:removeTasks(nil, self.auto_callback) end) end
-    if not self.auto_enabled then self.auto_next_epoch = nil; return true end
-    local delay, target = seconds_until(self.auto_hour, self.auto_minute)
+    local cadence = valid_cadence(self.auto_cadence) and self.auto_cadence or "manual"
+    if cadence == "manual" then
+        self.auto_next_epoch = nil
+        return true
+    end
+
+    local target = next_delivery_epoch(
+        self.auto_hour or 6,
+        self.auto_minute or 30,
+        cadence,
+        self.auto_weekly_wday or 1
+    )
+    if not target then
+        self.auto_next_epoch = nil
+        return false
+    end
+
     self.auto_next_epoch = target
-    Device.wakeup_mgr:addTask(delay, self.auto_callback)
+    Device.wakeup_mgr:addTask(math.max(60, target - os.time()), self.auto_callback)
     return true
 end
 
-function MorningPaper:setAutoEnabled(enabled)
-    self.auto_enabled = enabled and true or false
-    self.last_auto_status = self.auto_enabled and "Scheduled" or "Disabled"
+function Core:setAutoCadence(cadence)
+    if not valid_cadence(cadence) then return end
+    self.auto_cadence = cadence
+    self.auto_enabled = cadence ~= "manual"
+    self.last_auto_status = self.auto_enabled and ("Scheduled · " .. CADENCE_LABELS[cadence]) or "Manual only"
     self:saveAutoSettings()
     local supported = self:scheduleAutoDelivery(true)
-    if self.auto_enabled and not supported then UIManager:show(InfoMessage:new{ text=_("This device does not expose KOReader's hardware wake scheduler, so automatic delivery is unavailable here.") }) end
+    if self.auto_enabled and not supported then
+        UIManager:show(InfoMessage:new{
+            text=_("This device does not expose KOReader's hardware wake scheduler, so automatic delivery is unavailable here."),
+        })
+    end
 end
 
-function MorningPaper:setDeliveryTime(hour, minute)
-    self.auto_hour, self.auto_minute = hour, minute
+function Core:setAutoEnabled(enabled)
+    self:setAutoCadence(enabled and "daily" or "manual")
+end
+
+function Core:setWeeklyDay(wday)
+    wday = tonumber(wday)
+    if not wday or wday < 1 or wday > 7 then return end
+    self.auto_weekly_wday = wday
     self:saveAutoSettings()
-    if self.auto_enabled then self:scheduleAutoDelivery(true) end
+    if self.auto_cadence == "weekly" then self:scheduleAutoDelivery(true) end
 end
 
-function MorningPaper:autoStatusText()
-    local enabled = self.auto_enabled and "ON" or "OFF"
-    local delivery = os.date("%I:%M %p", os.time{year=2000, month=1, day=1, hour=self.auto_hour, min=self.auto_minute, sec=0}):gsub("^0", "")
-    local next_text = self.auto_next_epoch and os.date("%a %b %d, %I:%M %p", self.auto_next_epoch):gsub(" 0", " ") or "Not scheduled"
-    return string.format("Auto delivery: %s\nDelivery time: %s\nNext delivery: %s\nLast result: %s", enabled, delivery, next_text, self.last_auto_status or "Unknown")
+function Core:setDeliveryTime(hour, minute)
+    self.auto_hour = hour
+    self.auto_minute = minute
+    self:saveAutoSettings()
+    if self.auto_cadence ~= "manual" then self:scheduleAutoDelivery(true) end
 end
 
-function MorningPaper:aiStatusText()
-    local _, key_source = Newsroom.findOpenRouterKey(self.ai_api_key)
-    local effective, model_source = Newsroom.resolveModel(self.ai_model)
-    local cost_line = self.last_ai_cost and string.format("\nLast reported AI cost: $%.4f", tonumber(self.last_ai_cost) or 0) or ""
+function Core:autoStatusText()
+    local cadence = valid_cadence(self.auto_cadence) and self.auto_cadence or "manual"
+    local delivery = os.date("%I:%M %p", os.time{
+        year=2000, month=1, day=1,
+        hour=self.auto_hour or 6,
+        min=self.auto_minute or 30,
+        sec=0,
+    }):gsub("^0", "")
+    local next_text = self.auto_next_epoch
+        and os.date("%a %b %d, %I:%M %p", self.auto_next_epoch):gsub(" 0", " ")
+        or "Not scheduled"
+    local weekly_line = ""
+    if cadence == "weekly" then
+        local selected = DAYS[self.auto_weekly_wday or 1]
+        weekly_line = "\nWeekly day: " .. (selected and selected.label or "Sunday")
+    end
     return string.format(
-        "AI Newsroom: %s\nConfigured model: %s\nEffective model: %s\nModel source: %s\nAPI key: %s\nLast result: %s%s\n\nEach desk compares accessible reporting and writes original Morning Paper stories. Source articles stay research material; WSJ feeds remain agenda signals only.",
-        self.ai_enabled and "ON" or "OFF", configured_model_label(self.ai_model), tostring(effective), tostring(model_source), key_source, self.last_ai_status or "Unknown", cost_line
+        "Delivery frequency: %s%s\nDelivery time: %s\nNext delivery: %s\nLast result: %s",
+        CADENCE_LABELS[cadence] or cadence,
+        weekly_line,
+        delivery,
+        next_text,
+        self.last_auto_status or "Unknown"
     )
 end
 
-function MorningPaper:setAIEnabled(enabled)
-    self.ai_enabled = enabled and true or false
-    self.last_ai_status = self.ai_enabled and "Enabled; waiting for next refresh" or "Disabled"
-    self:saveAISettings()
+function Core:runtimeDiagnosticsText()
+    local wake = Device.wakeup_mgr and "available" or "NOT AVAILABLE"
+    local lead_version = newsroom_ok and type(Newsroom) == "table"
+        and tostring(Newsroom.CONSENSUS_LEAD_DESK_VERSION or "loaded") or nil
+    local lead_state = newsroom_ok and ("loaded · " .. tostring(lead_version))
+        or ("ERROR: " .. tostring(newsroom_error or "unknown"))
+    local source_state = sources_ok and type(sources) == "table"
+        and (tostring(#sources) .. " configured sources") or "ERROR loading sources.lua"
+
+    return table.concat({
+        "Morning Paper runtime: " .. RUNTIME_BUILD,
+        "Core file: main_v07.lua compatibility runtime",
+        "Wake scheduler: " .. wake,
+        "Consensus Lead Desk: " .. lead_state,
+        "Coverage scan feeds configured: " .. tostring(configured_scans),
+        "Editorial/paywall lead feeds configured: " .. tostring(configured_leads),
+        "New coverage definitions injected: " .. tostring(injected_scans),
+        "New paywall definitions injected: " .. tostring(injected_leads),
+        "Research pool: " .. source_state,
+        "",
+        self:autoStatusText(),
+        "",
+        "AI enabled: " .. (self.ai_enabled and "ON" or "OFF"),
+        "Last AI result: " .. tostring(self.last_ai_status or "Unknown"),
+    }, "\n")
 end
 
-function MorningPaper:setAIModel(model)
-    self.ai_model = model
-    local effective = Newsroom.resolveModel(model)
-    self.last_ai_status = "Model changed; next refresh will use " .. tostring(effective)
-    self:saveAISettings()
-    UIManager:show(InfoMessage:new{ text=self:aiStatusText() })
+local function menu_index_by_text(items, text)
+    for i, item in ipairs(items or {}) do
+        if tostring(item.text or "") == text then return i end
+    end
+    return nil
 end
 
-function MorningPaper:promptForCustomModel()
-    local dialog
-    dialog = InputDialog:new{
-        title=_("OpenRouter model ID"),
-        input=(self.ai_model ~= Newsroom.FOLLOW_MODEL and self.ai_model ~= Newsroom.FREE_MODEL) and self.ai_model or "",
-        input_hint="anthropic/claude-sonnet-5",
-        description=_("Enter an OpenRouter model ID. Use Follow KOAssistant if you want Morning Paper to mirror KOAssistant automatically."),
-        buttons={{{ text=_("Cancel"), callback=function() UIManager:close(dialog) end }, { text=_("Save"), callback=function()
-            local value = dialog:getInputText() or ""
-            value = value:gsub("^%s+", ""):gsub("%s+$", "")
-            if value ~= "" then self.ai_model = value; self:saveAISettings() end
-            UIManager:close(dialog)
-        end }}},
+function Core:addToMainMenu(menu_items)
+    core_add_menu(self, menu_items)
+    local root = menu_items.morning_paper
+    if not root or not root.sub_item_table then return end
+    local items = root.sub_item_table
+
+    local frequency = {
+        { text=_("Every morning"), checked_func=function() return self.auto_cadence == "daily" end,
+          callback=function() self:setAutoCadence("daily"); UIManager:show(InfoMessage:new{ text=self:autoStatusText() }) end },
+        { text=_("Weekdays"), checked_func=function() return self.auto_cadence == "weekdays" end,
+          callback=function() self:setAutoCadence("weekdays"); UIManager:show(InfoMessage:new{ text=self:autoStatusText() }) end },
+        { text=_("Once a week"), checked_func=function() return self.auto_cadence == "weekly" end,
+          callback=function() self:setAutoCadence("weekly"); UIManager:show(InfoMessage:new{ text=self:autoStatusText() }) end },
+        { text=_("Manual only"), checked_func=function() return self.auto_cadence == "manual" end,
+          callback=function() self:setAutoCadence("manual"); UIManager:show(InfoMessage:new{ text=self:autoStatusText() }) end },
     }
-    UIManager:show(dialog); dialog:onShowKeyboard()
-end
 
-function MorningPaper:promptForOpenRouterKey()
-    local dialog
-    dialog = InputDialog:new{
-        title=_("OpenRouter API key"), input=self.ai_api_key or "", input_hint="sk-or-v1-…",
-        description=_("Optional. Morning Paper will reuse KOAssistant's OpenRouter key when available."),
-        buttons={{{ text=_("Cancel"), callback=function() UIManager:close(dialog) end }, { text=_("Save"), callback=function()
-            self.ai_api_key = dialog:getInputText() or ""; self.ai_enabled = true
-            self.last_ai_status = "API key saved; waiting for next refresh"; self:saveAISettings(); UIManager:close(dialog)
-        end }}},
-    }
-    UIManager:show(dialog); dialog:onShowKeyboard()
-end
-
-function MorningPaper:onAutoDeliveryWake()
-    if not self.auto_enabled then return end
-    self:scheduleAutoDelivery(false)
-    local wifi_was_on = NetworkMgr:getWifiState() and true or false
-    local function finish(status)
-        self.last_auto_status = status; self:saveAutoSettings()
-        if not wifi_was_on and NetworkMgr:getWifiState() and type(NetworkMgr.turnOffWifi) == "function" then
-            UIManager:scheduleIn(20, function() pcall(function() NetworkMgr:turnOffWifi() end) end)
-        end
-    end
-    local function run()
-        local ok, result = pcall(function() return self:buildPaper{automatic=true} end)
-        if ok and result then finish("Delivered " .. os.date("%Y-%m-%d %H:%M"))
-        elseif ok then finish("Delivery failed while building paper")
-        else finish("Delivery error: " .. tostring(result)) end
-    end
-    local started = NetworkMgr:goOnlineToRun(run)
-    if not started then finish("Could not auto-enable Wi-Fi; set KOReader Wi-Fi action to Turn on") end
-end
-
-function MorningPaper:onCloseWidget()
-    if Device.wakeup_mgr and self.auto_callback then pcall(function() Device.wakeup_mgr:removeTasks(nil, self.auto_callback) end) end
-end
-
-function MorningPaper:latestPath()
-    local best, best_mtime
-    if lfs.attributes(self.output_dir, "mode") ~= "directory" then return nil end
-    for file in lfs.dir(self.output_dir) do
-        if file:match("^Morning Paper %d%d%d%d%-%d%d%-%d%d%.epub$") or file:match("^Morning Paper %d%d%d%d%-%d%d%-%d%d%.html$") then
-            local path = self.output_dir .. "/" .. file
-            local attrs = lfs.attributes(path)
-            if attrs and (not best_mtime or attrs.modification > best_mtime) then best, best_mtime = path, attrs.modification end
-        end
-    end
-    return best
-end
-
-function MorningPaper:openLatest()
-    local path = self:latestPath()
-    if not path then UIManager:show(InfoMessage:new{ text=_("No Morning Paper issue exists yet. Refresh today's paper first.") }); return end
-    require("apps/reader/readerui"):showReader(path)
-end
-
-function MorningPaper:buildPaper(opts)
-    opts = opts or {}
-    if self.sources_error then
-        if not opts.automatic then UIManager:show(InfoMessage:new{ text="Morning Paper could not load sources.lua:\n" .. self.sources_error }) end
-        return false
-    end
-
-    local issue_epoch = os.time()
-    local issue_date = os.date("%Y-%m-%d", issue_epoch)
-    local nice_date = os.date("%A, %B %d, %Y", issue_epoch)
-    local edition_time = os.date("%I:%M %p", issue_epoch):gsub("^0", "")
-    local research_sections, seen, failures = {}, {}, {}
-    local agenda_items, agenda_seen = {}, {}
-    local source_total, full_count, excerpt_count, stale_count = 0, 0, 0, 0
-    local article_counter = 0
-
-    for _, src in ipairs(self.sources) do
-        if src.enabled ~= false then
-            local xml, err = http_get(src.url)
-            if not xml then failures[#failures + 1] = src.name .. ": " .. tostring(err)
-            else
-                local items = parse_rss(xml, src.limit or 3)
-                if #items == 0 then items = parse_atom(xml, src.limit or 3) end
-                if src.agenda_only then
-                    for _, item in ipairs(items) do
-                        local key = normalize_title(item.title)
-                        if not is_fresh(item.date, src.max_age_hours) then stale_count = stale_count + 1
-                        elseif key ~= "" and not agenda_seen[key] then
-                            agenda_seen[key] = true; item.source = src.name; item.agenda_category = src.agenda_category or "WSJ"
-                            item.published_epoch = parse_date_epoch(item.date) or 0; agenda_items[#agenda_items + 1] = item
-                        end
-                    end
-                else
-                    research_sections[src.section] = research_sections[src.section] or {}
-                    for _, item in ipairs(items) do
-                        local key = normalize_title(item.title)
-                        if not is_fresh(item.date, src.max_age_hours) then stale_count = stale_count + 1
-                        elseif key ~= "" and not seen[key] then
-                            seen[key] = true; item.source = src.name; item.published_epoch = parse_date_epoch(item.date) or 0
-                            item.content_mode = "Feed excerpt"; item.body = ArticleFetcher.cleanText(item.description)
-                            if src.full_text ~= false and item.link ~= "" then
-                                local body, mode, final_url = ArticleFetcher.fetch(item.link, {min_chars=src.min_fulltext_chars or 350})
-                                if body and body ~= "" then
-                                    item.body = ArticleFetcher.cleanText(body); item.content_mode = "Full article"; item.extract_mode = mode
-                                    item.link = final_url or item.link; full_count = full_count + 1
-                                else item.extract_error = mode; excerpt_count = excerpt_count + 1 end
-                            else excerpt_count = excerpt_count + 1 end
-                            item.body = ArticleFetcher.cleanText(item.body)
-                            if item.body == "" or #item.body < 60 then item.body = "A clean full-text copy was not available from this publisher."; item.content_mode = "Source link only" end
-                            research_sections[src.section][#research_sections[src.section] + 1] = item
-                            source_total = source_total + 1; article_counter = article_counter + 1
-                            if article_counter % 4 == 0 then collectgarbage("collect") end
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    for _, section in ipairs(NEWS_SECTIONS) do
-        local items = research_sections[section]
-        if items then table.sort(items, function(a, b)
-            local ae, be = a.published_epoch or 0, b.published_epoch or 0
-            if ae == be then return (a.title or "") < (b.title or "") end
-            return ae > be
-        end) end
-    end
-    table.sort(agenda_items, function(a, b) return (a.published_epoch or 0) > (b.published_epoch or 0) end)
-
-    local publish_sections = research_sections
-    local ai_count, model_used, newsroom_stats = 0, nil, nil
-    if self.ai_enabled then
-        local ai_key, key_source = Newsroom.findOpenRouterKey(self.ai_api_key)
-        if ai_key then
-            local newsroom_sections, ai_err, used, generated_count, stats = Newsroom.generate{
-                api_key=ai_key, model=self.ai_model, sections=research_sections, section_order=NEWS_SECTIONS,
-                agenda_items=agenda_items, date=issue_date, nice_date=nice_date, edition_time=edition_time,
-            }
-            newsroom_stats = stats
-            if newsroom_sections and generated_count and generated_count > 0 then
-                publish_sections = newsroom_sections; ai_count = generated_count; model_used = used
-                publish_sections["Sources & Further Reading"] = make_source_appendix(research_sections, agenda_items)
-                local _, section_count = count_newsroom(publish_sections)
-                self.last_ai_status = string.format("Published %d stories across %d desks via %s (%s)", ai_count, section_count, tostring(used), key_source)
-                if stats and stats.cost_known then self.last_ai_cost = stats.cost end
-            else
-                self.last_ai_status = "AI newsroom failed; source-article fallback used: " .. tostring(ai_err)
-                failures[#failures + 1] = "AI Newsroom: " .. tostring(ai_err)
-            end
-        else
-            self.last_ai_status = "AI newsroom enabled, but no OpenRouter key was found; source-article fallback used"
-            failures[#failures + 1] = "AI Newsroom: no OpenRouter key"
-        end
-        self:saveAISettings()
-    end
-
-    local published_total, active_sections = count_newsroom(publish_sections)
-    local path = self.output_dir .. "/Morning Paper " .. issue_date .. ".epub"
-    local ok, err = EpubBuilder.build(path, {
-        date=issue_date, nice_date=nice_date, edition_time=edition_time,
-        title="Morning Paper — " .. nice_date, uid="urn:morningpaper:" .. issue_date,
-        sections=publish_sections, section_order=ai_count > 0 and PUBLISH_ORDER or NEWS_SECTIONS,
-        total=published_total, full_count=full_count, excerpt_count=excerpt_count, source_count=source_total,
-        ai_enhanced=ai_count > 0, model_used=model_used,
-    })
-    if not ok then
-        if not opts.automatic then UIManager:show(InfoMessage:new{ text="Could not build EPUB edition:\n" .. tostring(err) }) end
-        return false
-    end
-    pcall(os.remove, self.output_dir .. "/Morning Paper " .. issue_date .. ".html")
-
-    if not opts.automatic then
-        local lines = {
-            string.format("Morning Paper researched %d source stories.", source_total),
-            string.format("%d full source articles fetched.", full_count),
+    local weekly_days = {}
+    for _, day in ipairs(DAYS) do
+        local d = day
+        weekly_days[#weekly_days + 1] = {
+            text=_(d.label),
+            checked_func=function() return self.auto_weekly_wday == d.wday end,
+            callback=function()
+                self:setWeeklyDay(d.wday)
+                UIManager:show(InfoMessage:new{ text=self:autoStatusText() })
+            end,
         }
-        if ai_count > 0 then
-            lines[#lines + 1] = string.format("%d original AI-enhanced stories published across %d sections.", ai_count, active_sections)
-            lines[#lines + 1] = "Model: " .. tostring(model_used)
-            if newsroom_stats then
-                lines[#lines + 1] = string.format("Newsroom calls: %d%s", newsroom_stats.calls or 0, (newsroom_stats.retries or 0) > 0 and (" · fallbacks: " .. tostring(newsroom_stats.retries)) or "")
-                if newsroom_stats.cost_known then lines[#lines + 1] = string.format("Reported AI cost: $%.4f", newsroom_stats.cost or 0) end
-                if newsroom_stats.warnings and #newsroom_stats.warnings > 0 then lines[#lines + 1] = tostring(#newsroom_stats.warnings) .. " desk warnings; successful desks were kept." end
-            end
-            lines[#lines + 1] = "Source reports are compactly indexed at the back; the main TOC contains real newsroom headlines."
-        else lines[#lines + 1] = "AI newsroom unavailable — this edition uses direct source reporting." end
-        if stale_count > 0 then lines[#lines + 1] = stale_count .. " stale feed entries skipped." end
-        if #failures > 0 then lines[#lines + 1] = #failures .. " source/AI steps had errors." end
-        lines[#lines + 1] = "\n" .. path
-        UIManager:show(ConfirmBox:new{
-            text=table.concat(lines, "\n"), ok_text=_("Open"), cancel_text=_("Close"),
-            ok_callback=function() require("apps/reader/readerui"):showReader(path) end,
-        })
     end
-    return true
-end
 
-function MorningPaper:showSources()
-    if self.sources_error then UIManager:show(InfoMessage:new{ text=self.sources_error }); return end
-    local lines = {}
-    for _, src in ipairs(self.sources) do
-        local state = src.enabled == false and "OFF" or "ON"
-        local role = src.agenda_only and "AGENDA ONLY" or src.section
-        lines[#lines + 1] = string.format("[%s] %s — %s\n%s", state, role, src.name, src.url)
-    end
-    UIManager:show(InfoMessage:new{ text=table.concat(lines, "\n\n") })
-end
-
-function MorningPaper:addToMainMenu(menu_items)
-    local auto_submenu = {
-        { text=_("Enable automatic delivery"), checked_func=function() return self.auto_enabled end, callback=function()
-            self:setAutoEnabled(not self.auto_enabled); UIManager:show(InfoMessage:new{ text=self:autoStatusText() })
-        end },
-        { text=_("Delivery time"), separator=true },
-    }
+    local times = {}
     for _, preset in ipairs(DELIVERY_TIMES) do
         local p = preset
-        auto_submenu[#auto_submenu + 1] = { text=p.label, checked_func=function() return self.auto_hour == p.hour and self.auto_minute == p.minute end,
-            callback=function() self:setDeliveryTime(p.hour, p.minute); UIManager:show(InfoMessage:new{ text=self:autoStatusText() }) end }
+        times[#times + 1] = {
+            text=p.label,
+            checked_func=function() return self.auto_hour == p.hour and self.auto_minute == p.minute end,
+            callback=function()
+                self:setDeliveryTime(p.hour, p.minute)
+                UIManager:show(InfoMessage:new{ text=self:autoStatusText() })
+            end,
+        }
     end
-    auto_submenu[#auto_submenu + 1] = { text=_("Auto-delivery status"), separator=true, callback=function() UIManager:show(InfoMessage:new{ text=self:autoStatusText() }) end }
 
-    local model_submenu = {
-        { text=_("Follow KOAssistant"), checked_func=function() return self.ai_model == Newsroom.FOLLOW_MODEL end, callback=function() self:setAIModel(Newsroom.FOLLOW_MODEL) end },
-        { text=_("Claude Sonnet 5"), checked_func=function() return self.ai_model == Newsroom.SONNET5_MODEL end, callback=function() self:setAIModel(Newsroom.SONNET5_MODEL) end },
-        { text=_("OpenRouter Free"), checked_func=function() return self.ai_model == Newsroom.FREE_MODEL end, callback=function() self:setAIModel(Newsroom.FREE_MODEL) end },
-        { text=_("Custom OpenRouter model…"), callback=function() self:promptForCustomModel() end },
-    }
-    local ai_submenu = {
-        { text=_("Enable AI Newsroom"), checked_func=function() return self.ai_enabled end, callback=function() self:setAIEnabled(not self.ai_enabled); UIManager:show(InfoMessage:new{ text=self:aiStatusText() }) end },
-        { text=_("Model"), sub_item_table=model_submenu },
-        { text=_("Set OpenRouter API key"), callback=function() self:promptForOpenRouterKey() end },
-        { text=_("Clear Morning Paper API key"), callback=function()
-            self.ai_api_key = ""; self.last_ai_status = "Morning Paper key cleared; KOAssistant key will still be reused if available"; self:saveAISettings(); UIManager:show(InfoMessage:new{ text=self:aiStatusText() })
-        end },
-        { text=_("AI newsroom status"), separator=true, callback=function() UIManager:show(InfoMessage:new{ text=self:aiStatusText() }) end },
-    }
-
-    menu_items.morning_paper = {
-        text=_("Morning Paper"), sorting_hint="tools",
+    local auto_index = menu_index_by_text(items, _("Automatic delivery")) or 3
+    items[auto_index] = {
+        text=_("Automatic delivery · " .. RUNTIME_BUILD),
         sub_item_table={
-            { text=_("Refresh today's paper"), callback=function() NetworkMgr:runWhenOnline(function() self:buildPaper() end) end },
-            { text=_("Open latest paper"), callback=function() self:openLatest() end },
-            { text=_("Automatic delivery"), sub_item_table=auto_submenu },
-            { text=_("AI Newsroom"), sub_item_table=ai_submenu },
-            { text=_("Sources"), callback=function() self:showSources() end },
-            { text=_("About"), callback=function() UIManager:show(InfoMessage:new{ text=_("Morning Paper 0.7 is a section-by-section AI newsroom. It researches public reporting, generates a full original edition across Front Page, World, U.S., Business & Markets, Technology & AI, Science, and Culture, builds concise headline-level TOC entries, and keeps source material in a compact reference appendix. It does not force false political balance and never bypasses paywalls.") }) end },
+            { text=_("Frequency"), sub_item_table=frequency },
+            { text=_("Weekly delivery day"), enabled_func=function() return self.auto_cadence == "weekly" end, sub_item_table=weekly_days },
+            { text=_("Delivery time"), sub_item_table=times },
+            { text=_("Delivery status"), separator=true, callback=function()
+                UIManager:show(InfoMessage:new{ text=self:autoStatusText() })
+            end },
+            { text=_("Runtime check · " .. RUNTIME_BUILD), callback=function()
+                UIManager:show(InfoMessage:new{ text=self:runtimeDiagnosticsText() })
+            end },
         },
     }
+
+    local about_index = menu_index_by_text(items, _("About"))
+    local diagnostic = {
+        text=_("Runtime & system check · " .. RUNTIME_BUILD),
+        callback=function() UIManager:show(InfoMessage:new{ text=self:runtimeDiagnosticsText() }) end,
+    }
+    if about_index then
+        table.insert(items, about_index, diagnostic)
+        about_index = about_index + 1
+        items[about_index] = {
+            text=_("About"),
+            callback=function()
+                UIManager:show(InfoMessage:new{
+                    text=_("Morning Paper " .. RUNTIME_BUILD .. " is running the current compatibility runtime. It supports daily, weekday, weekly, or manual delivery and the consensus lead-first AI newsroom."),
+                })
+            end,
+        }
+    else
+        items[#items + 1] = diagnostic
+        items[#items + 1] = {
+            text=_("About"),
+            callback=function()
+                UIManager:show(InfoMessage:new{ text=_("Morning Paper " .. RUNTIME_BUILD .. " runtime loaded.") })
+            end,
+        }
+    end
 end
 
-return MorningPaper
+return Core
