@@ -7,6 +7,7 @@ local DataStorage = require("datastorage")
 local Device = require("device")
 local lfs = require("libs/libkoreader-lfs")
 local ArticleFetcher = require("article_fetcher")
+local EpubBuilder = require("epub_builder")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
@@ -38,16 +39,10 @@ local function safe_mkdir(path)
     if lfs.attributes(path, "mode") ~= "directory" then pcall(lfs.mkdir, path) end
 end
 
-local function html_escape(s)
-    s = tostring(s or "")
-    return s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;")
-end
-
 local function raw_tag(block, name)
     local value = block:match("<" .. name .. "[^>]*>(.-)</" .. name .. ">")
     if not value then return "" end
-    value = value:gsub("<!%[CDATA%[(.-)%]%]>", "%1")
-    return value
+    return value:gsub("<!%[CDATA%[(.-)%]%]>", "%1")
 end
 
 local function clean_tag(block, name)
@@ -56,9 +51,12 @@ end
 
 local function decode_link(s)
     s = tostring(s or ""):gsub("<!%[CDATA%[(.-)%]%]>", "%1")
-    s = s:gsub("&amp;", "&"):gsub("&#38;", "&"):gsub("&quot;", '"')
-    s = s:gsub("^%s+", ""):gsub("%s+$", "")
-    return s
+    for _ = 1, 3 do
+        local before = s
+        s = s:gsub("&amp;", "&"):gsub("&#38;", "&"):gsub("&quot;", '"'):gsub("&#39;", "'")
+        if s == before then break end
+    end
+    return s:gsub("^%s+", ""):gsub("%s+$", "")
 end
 
 local function parse_rss(xml, limit)
@@ -170,7 +168,7 @@ local function http_get(url)
         url=url,
         sink=ltn12.sink.table(chunks),
         headers={
-            ["User-Agent"]="KOReader MorningPaper/0.3.1",
+            ["User-Agent"]="KOReader MorningPaper/0.4",
             ["Accept"]="application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
         },
     }
@@ -181,19 +179,6 @@ local function http_get(url)
     end
     if code >= 400 then return nil, "HTTP " .. tostring(code) end
     return table.concat(chunks), nil
-end
-
-local function text_to_html(text)
-    local clean = ArticleFetcher.cleanText(text)
-    if clean == "" then return "" end
-    local out = {}
-    local normalized = clean:gsub("\r\n", "\n"):gsub("\r", "\n") .. "\n\n"
-    for para in normalized:gmatch("(.-)\n%s*\n") do
-        para = para:gsub("^%s+", ""):gsub("%s+$", "")
-        if para ~= "" then out[#out + 1] = "<p>" .. html_escape(para) .. "</p>" end
-    end
-    if #out == 0 then out[1] = "<p>" .. html_escape(clean) .. "</p>" end
-    return table.concat(out, "\n")
 end
 
 local function seconds_until(hour, minute)
@@ -318,7 +303,7 @@ function MorningPaper:latestPath()
     local best, best_mtime
     if lfs.attributes(self.output_dir, "mode") ~= "directory" then return nil end
     for file in lfs.dir(self.output_dir) do
-        if file:match("^Morning Paper %d%d%d%d%-%d%d%-%d%d%.html$") then
+        if file:match("^Morning Paper %d%d%d%d%-%d%d%-%d%d%.epub$") or file:match("^Morning Paper %d%d%d%d%-%d%d%-%d%d%.html$") then
             local path = self.output_dir .. "/" .. file
             local attrs = lfs.attributes(path)
             if attrs and (not best_mtime or attrs.modification > best_mtime) then
@@ -346,8 +331,13 @@ function MorningPaper:buildPaper(opts)
         return false
     end
 
+    local issue_epoch = os.time()
+    local issue_date = os.date("%Y-%m-%d", issue_epoch)
+    local nice_date = os.date("%A, %B %d, %Y", issue_epoch)
+    local edition_time = os.date("%I:%M %p", issue_epoch):gsub("^0", "")
+
     local sections, seen, failures = {}, {}, {}
-    local total, full_count, excerpt_count, stale_count, clean_fallback_count = 0, 0, 0, 0, 0
+    local total, full_count, excerpt_count, stale_count = 0, 0, 0, 0
     local article_counter = 0
 
     for _, src in ipairs(self.sources) do
@@ -382,13 +372,12 @@ function MorningPaper:buildPaper(opts)
                             else
                                 item.extract_error = mode
                                 excerpt_count = excerpt_count + 1
-                                clean_fallback_count = clean_fallback_count + 1
                             end
                         else
                             excerpt_count = excerpt_count + 1
                         end
 
-                        -- Final safety pass: raw HTML, hrefs and giant tracking URLs never reach the paper.
+                        -- Final safety pass: never let raw markup, giant hrefs or tracking URLs into the edition.
                         item.body = ArticleFetcher.cleanText(item.body)
                         if item.body == "" or #item.body < 60 then
                             item.body = "A clean full-text copy was not available from this publisher. Use “Open original article” below to read it on the source site."
@@ -416,65 +405,34 @@ function MorningPaper:buildPaper(opts)
         end
     end
 
-    local path = self.output_dir .. "/Morning Paper " .. os.date("%Y-%m-%d") .. ".html"
-    local f, ferr = io.open(path, "wb")
-    if not f then
-        if not opts.automatic then UIManager:show(InfoMessage:new{ text="Could not write paper:\n" .. tostring(ferr) }) end
+    local path = self.output_dir .. "/Morning Paper " .. issue_date .. ".epub"
+    local ok, err = EpubBuilder.build(path, {
+        date=issue_date,
+        nice_date=nice_date,
+        edition_time=edition_time,
+        title="Morning Paper — " .. nice_date,
+        uid="urn:morningpaper:" .. issue_date,
+        sections=sections,
+        section_order=SECTION_ORDER,
+        total=total,
+        full_count=full_count,
+        excerpt_count=excerpt_count,
+    })
+
+    if not ok then
+        if not opts.automatic then UIManager:show(InfoMessage:new{ text="Could not build EPUB edition:\n" .. tostring(err) }) end
         return false
     end
 
-    f:write([[<!doctype html><html><head><meta charset="utf-8"><title>Morning Paper</title><style>
-body{font-family:serif;line-height:1.5;max-width:48em;margin:auto;padding:1.2em}h1{font-size:2em;margin-bottom:.1em}h2{margin-top:2em;border-bottom:1px solid #777;padding-bottom:.2em}h3{font-size:1.35em}.article{margin:1.5em 0 2.4em}.meta{font-size:.85em}.mode{font-size:.82em;font-style:italic}.toc a{text-decoration:none}.original{font-size:.9em}.rule{border-top:1px solid #aaa;margin-top:2em}</style></head><body>]])
-    f:write("<h1>Morning Paper</h1><p><strong>" .. html_escape(os.date("%A, %B %d, %Y")) .. "</strong></p>")
-    f:write("<p>" .. total .. " current stories · " .. full_count .. " full articles fetched · " .. excerpt_count .. " clean fallbacks</p>")
-    f:write("<p><em>Newest stories are listed first. Publisher timestamps are preserved as supplied, including GMT/UTC dates that may be a day ahead of local time.</em></p>")
-    f:write("<p><em>All displayed story text is sanitized before publishing: HTML tags, href fragments, tracking URLs, newsletter prompts and common page boilerplate are removed.</em></p>")
-    f:write("<p><em>Morning Paper does not bypass subscriptions, logins or paywalls.</em></p>")
-    f:write("<h2>Contents</h2><div class='toc'><ul>")
-    for _, section in ipairs(SECTION_ORDER) do
-        if sections[section] and #sections[section] > 0 then
-            f:write("<li><a href='#" .. section:gsub("%W", "") .. "'>" .. html_escape(section) .. "</a> (" .. #sections[section] .. ")</li>")
-        end
-    end
-    f:write("</ul></div>")
-
-    local article_id = 0
-    for _, section in ipairs(SECTION_ORDER) do
-        local items = sections[section]
-        if items and #items > 0 then
-            f:write("<h2 id='" .. section:gsub("%W", "") .. "'>" .. html_escape(section) .. "</h2>")
-            for _, item in ipairs(items) do
-                article_id = article_id + 1
-                f:write("<div class='article' id='story" .. article_id .. "'><h3>" .. html_escape(item.title) .. "</h3>")
-                f:write("<div class='meta'>" .. html_escape(item.source))
-                if item.date ~= "" then f:write(" · " .. html_escape(item.date)) end
-                f:write("</div><div class='mode'>" .. html_escape(item.content_mode))
-                if item.content_mode ~= "Full article" and item.extract_error then f:write(" · " .. html_escape(item.extract_error)) end
-                f:write("</div>")
-
-                local rendered = text_to_html(item.body)
-                if rendered ~= "" then f:write(rendered) else f:write("<p>No clean text was available from this source.</p>") end
-                if item.link ~= "" then f:write("<p class='original'><a href='" .. html_escape(item.link) .. "'>Open original article</a></p>") end
-                f:write("<div class='rule'></div></div>")
-            end
-        end
-    end
-
-    if #failures > 0 or stale_count > 0 then
-        f:write("<h2>Source notes</h2>")
-        if stale_count > 0 then f:write("<p>Skipped " .. stale_count .. " stale feed entries.</p>") end
-        if #failures > 0 then
-            f:write("<ul>")
-            for _, e in ipairs(failures) do f:write("<li>" .. html_escape(e) .. "</li>") end
-            f:write("</ul>")
-        end
-    end
-    f:write("</body></html>")
-    f:close()
+    -- Remove the old same-day HTML edition after a successful EPUB build so the library does not show duplicates.
+    pcall(os.remove, self.output_dir .. "/Morning Paper " .. issue_date .. ".html")
 
     if not opts.automatic then
+        local note = ""
+        if stale_count > 0 then note = note .. "\n" .. stale_count .. " stale feed entries skipped." end
+        if #failures > 0 then note = note .. "\n" .. #failures .. " source feeds had errors." end
         UIManager:show(ConfirmBox:new{
-            text=T(_("Morning Paper created with %1 stories.\n%2 full articles fetched.\n\n%3"), total, full_count, path),
+            text=T(_("Morning Paper created with %1 stories.\n%2 full articles fetched.\nA dated newspaper cover was embedded.\n\n%3%4"), total, full_count, path, note),
             ok_text=_("Open"),
             ok_callback=function() self.ui:onClose(); require("apps/reader/readerui"):showReader(path) end,
             cancel_text=_("Close"),
@@ -486,9 +444,9 @@ end
 function MorningPaper:showSources()
     if self.sources_error then UIManager:show(InfoMessage:new{ text=self.sources_error }); return end
     local lines = {}
-    for _, s in ipairs(self.sources) do
-        local state = s.enabled == false and "OFF" or "ON"
-        lines[#lines + 1] = string.format("[%s] %s — %s\n%s", state, s.section, s.name, s.url)
+    for _, src in ipairs(self.sources) do
+        local state = src.enabled == false and "OFF" or "ON"
+        lines[#lines + 1] = string.format("[%s] %s — %s\n%s", state, src.section, src.name, src.url)
     end
     UIManager:show(InfoMessage:new{ text=table.concat(lines, "\n\n") })
 end
@@ -535,7 +493,7 @@ function MorningPaper:addToMainMenu(menu_items)
             {
                 text=_("About"),
                 callback=function()
-                    UIManager:show(InfoMessage:new{ text=_("Morning Paper 0.3.1 sanitizes every article and feed fallback before rendering, removing raw HTML, href fragments, tracking URLs and common page boilerplate. Automatic hardware-wake delivery and publisher GMT/UTC timestamps remain supported. Paywalls are not bypassed.") })
+                    UIManager:show(InfoMessage:new{ text=_("Morning Paper 0.4 creates a real EPUB edition every day with an embedded newspaper-style cover, date, edition time and top headlines. It keeps newest-first ordering, clean article filtering and optional hardware-wake morning delivery. Publisher paywalls are not bypassed.") })
                 end,
             },
         },
