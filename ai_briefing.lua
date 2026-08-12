@@ -11,6 +11,16 @@ local AiBriefing = {}
 local DEFAULT_MODEL = "openrouter/free"
 local ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
+local ALLOWED_SECTIONS = {
+    ["Front Page"] = true,
+    ["World"] = true,
+    ["U.S."] = true,
+    ["Business & Markets"] = true,
+    ["Technology & AI"] = true,
+    ["Science"] = true,
+    ["Culture"] = true,
+}
+
 local function nonempty(s)
     return type(s) == "string" and s:gsub("%s+", "") ~= ""
 end
@@ -22,8 +32,6 @@ local function load_lua_table(path)
     return nil
 end
 
--- Prefer a Morning Paper key if the user explicitly saved one. Otherwise, try
--- to reuse an OpenRouter key the reader already configured for KOAssistant.
 function AiBriefing.findOpenRouterKey(explicit_key)
     if nonempty(explicit_key) then return explicit_key, "Morning Paper settings" end
 
@@ -52,9 +60,6 @@ function AiBriefing.findOpenRouterKey(explicit_key)
     return nil, "No OpenRouter key found"
 end
 
--- Reuse KOAssistant's active OpenRouter model when Morning Paper is still on its
--- default router. KOAssistant stores the active provider/model in features.provider
--- and features.model, so this stays independent of KOAssistant internals/API code.
 function AiBriefing.findKOAssistantModel()
     local settings_dir = DataStorage:getSettingsDir()
     local ko_settings = load_lua_table(settings_dir .. "/koassistant_settings.lua")
@@ -91,17 +96,16 @@ end
 local function sorted_story_pool(sections, section_order)
     local pool = {}
     for _, section in ipairs(section_order or {}) do
-        if section ~= "Intelligence Desk" then
-            for _, item in ipairs(sections[section] or {}) do
-                pool[#pool + 1] = {
-                    section = section,
-                    source = item.source or "Unknown",
-                    title = item.title or "",
-                    date = item.date or "",
-                    published_epoch = item.published_epoch or 0,
-                    body = item.body or item.description or "",
-                }
-            end
+        for _, item in ipairs(sections[section] or {}) do
+            pool[#pool + 1] = {
+                section = section,
+                source = item.source or "Unknown",
+                title = item.title or "",
+                date = item.date or "",
+                published_epoch = item.published_epoch or 0,
+                body = item.body or item.description or "",
+                content_mode = item.content_mode or "",
+            }
         end
     end
     table.sort(pool, function(a, b)
@@ -113,20 +117,19 @@ end
 local function build_material(sections, section_order, agenda_items)
     local pool = sorted_story_pool(sections, section_order)
     local reporting = {}
-    local source_counts = {}
-    local max_reporting = math.min(#pool, 36)
+    local max_reporting = math.min(#pool, 48)
 
     for i = 1, max_reporting do
         local item = pool[i]
-        source_counts[item.source] = (source_counts[item.source] or 0) + 1
         reporting[#reporting + 1] = string.format(
-            "REPORT %d\nSource: %s\nSection: %s\nPublished: %s\nHeadline: %s\nPublic text: %s",
+            "REPORT %d\nOutlet: %s\nOriginal desk: %s\nPublished: %s\nHeadline: %s\nMaterial quality: %s\nAccessible reporting: %s",
             i,
             clip(item.source, 100),
             clip(item.section, 60),
             clip(item.date, 100),
             clip(item.title, 260),
-            clip(item.body, 1200)
+            clip(item.content_mode, 80),
+            clip(item.body, 1000)
         )
     end
 
@@ -145,70 +148,99 @@ local function build_material(sections, section_order, agenda_items)
         )
     end
 
-    return table.concat(reporting, "\n\n"), table.concat(agenda, "\n\n"), source_counts
+    return table.concat(reporting, "\n\n"), table.concat(agenda, "\n\n")
 end
 
 local SYSTEM_PROMPT = [[
-You are the Intelligence Desk for a personal morning newspaper. Your job is not to imitate any publisher. Your job is to create original, fact-first synthesis from the source material supplied to you.
+You are the newsroom and editorial board for MORNING PAPER, a personal daily newspaper. The supplied material comes from multiple news organizations, public institutions, and public headline feeds. Your job is to turn that research packet into an ORIGINAL newspaper edition, not to summarize articles one by one.
 
-Editorial standard:
-- Use ONLY the supplied material. Do not browse, guess, fill gaps, or invent facts.
-- Wall Street Journal items marked AGENDA are public headline/feed signals only. They may tell you which topics WSJ is emphasizing, but they are NOT evidence for facts hidden behind a paywall. Never reconstruct a WSJ article from its headline.
-- Prefer topics that are consequential for business, markets, the economy, public policy, technology, national security, geopolitics, and ordinary life.
-- Prefer topics that appear in the fresh WSJ agenda list when the accessible reporting also supports them, but do not let WSJ determine the entire paper.
-- Ground each brief in at least two independent accessible reports whenever possible. One primary-source document plus one independent report is also acceptable. If a topic has only one weak source, omit it.
-- Separate confirmed facts from allegations, predictions, political claims, analysis, and opinion.
-- When credible sources materially disagree, explain the disagreement. Do not force false balance when the underlying evidence is lopsided.
-- Include materially different conservative, liberal, institutional, international, or market interpretations when they actually exist in the supplied reporting. Do not assign ideological labels unless necessary to explain the dispute.
-- For economic and market stories, explain the mechanism: what changed, why it matters, and what could move next.
-- Write clean original prose. Do not reproduce source wording and do not quote more than eight consecutive words from any source.
-- Be concise enough for a morning read but substantial enough that the reader understands the issue without opening five articles.
+CORE EDITORIAL PHILOSOPHY
+- Fact-first, multi-source, evidence-weighted, politically nonaligned.
+- Do not manufacture left/right symmetry. If evidence is lopsided, say so plainly. If credible accounts genuinely conflict, explain the conflict and why.
+- Separate established facts from allegations, predictions, political messaging, opinion, and unresolved claims.
+- Use ONLY supplied reporting. Never browse, guess, invent context, or fill factual gaps from memory.
+- WSJ entries marked AGENDA are public headline/topic signals only. They may influence which subjects deserve attention, but they are not evidence for details hidden behind a paywall.
+- Prefer primary documents/data when supplied, but explain them in ordinary language and compare them with independent reporting.
+- Treat every outlet as potentially incomplete. Compare what multiple outlets agree on, what each emphasizes, what is omitted, and whether those differences materially change the reader's understanding.
 
-Return a JSON object with one key named "briefs". "briefs" must contain 1 to 8 objects. Every brief must contain exactly:
-- "title": an original concise headline
-- "body": prose formatted as FACTS, WHY IT MATTERS, WHERE COVERAGE DIFFERS, and WATCH NEXT
-- "sources": an array of source names actually used
+WHAT THE READER WANTS
+The reader wants the news itself, not a list of what different outlets said. Each Morning Paper article should answer naturally, in polished newspaper prose:
+- What happened?
+- What is firmly established?
+- Why does this matter now?
+- What historical, economic, geopolitical, cultural, or institutional context is needed to understand it?
+- How might it affect the current political/social/economic climate or existing tensions, when that connection is genuinely supported by the supplied reporting?
+- Where do credible interpretations or interests differ?
+- What remains uncertain?
+- What should an informed reader watch next?
 
-If the reporting does not support five responsible multi-source briefs, return fewer rather than inventing material.
+WRITING STANDARD
+- Write as MORNING PAPER, not as BBC/Fox/Guardian/Epoch/etc.
+- Synthesize overlapping reports about the same event into ONE coherent story.
+- Do not merely paraphrase a single source paragraph by paragraph.
+- Natural newspaper prose: strong lead, clear context, significance, relevant disagreement, and forward-looking close.
+- Simplified enough to understand on a morning read, but more context-rich than a conventional short news article.
+- Avoid repetitive labels like "FACTS:" or "WHY IT MATTERS:" unless a rare story genuinely benefits from them.
+- Avoid ideological adjectives unless directly relevant and supported.
+- No sensationalism, clickbait, or partisan cheerleading.
+- Do not reproduce source wording. Never quote more than eight consecutive words from any supplied source.
+- Aim for roughly 250–500 words per story. Major Front Page stories may be somewhat longer if the source packet supports it.
+
+EDITION STRUCTURE
+Create 8 to 14 stories total when the source material supports them. Use these exact sections:
+Front Page
+World
+U.S.
+Business & Markets
+Technology & AI
+Science
+Culture
+
+Front Page should contain roughly 2–3 of the day's most consequential stories. Do not repeat those same stories again in another section. Other sections contain the most important remaining developments. It is fine for a section to have no story if nothing consequential is supported by the supplied material.
+
+A story should normally use multiple independent sources when possible. A consequential breaking story may use one strong source or primary document if that limitation is made clear in the prose. Never create artificial disagreement just to appear bipartisan.
+
+For every article, return the outlet names actually used as evidence. These citations are for transparency; the article itself should read as one coherent Morning Paper story.
 ]]
 
 local RESPONSE_FORMAT = {
     type = "json_schema",
     json_schema = {
-        name = "morning_paper_intelligence",
+        name = "morning_paper_edition",
         strict = true,
         schema = {
             type = "object",
             properties = {
-                briefs = {
+                articles = {
                     type = "array",
                     minItems = 1,
-                    maxItems = 8,
+                    maxItems = 14,
                     items = {
                         type = "object",
                         properties = {
+                            section = {
+                                type = "string",
+                                enum = { "Front Page", "World", "U.S.", "Business & Markets", "Technology & AI", "Science", "Culture" },
+                            },
                             title = { type = "string" },
                             body = { type = "string" },
-                            sources = {
-                                type = "array",
-                                items = { type = "string" },
-                            },
+                            sources = { type = "array", items = { type = "string" } },
                         },
-                        required = { "title", "body", "sources" },
+                        required = { "section", "title", "body", "sources" },
                         additionalProperties = false,
                     },
                 },
             },
-            required = { "briefs" },
+            required = { "articles" },
             additionalProperties = false,
         },
     },
 }
 
-local function as_brief_array(value)
+local function as_article_array(value)
     if type(value) ~= "table" then return nil end
-    if type(value.briefs) == "table" then return value.briefs end
     if type(value.articles) == "table" then return value.articles end
+    if type(value.briefs) == "table" then return value.briefs end
     if type(value.items) == "table" then return value.items end
     if #value > 0 then return value end
     return nil
@@ -217,26 +249,18 @@ end
 local function try_decode(text)
     if type(text) ~= "string" or text == "" then return nil end
     local ok, decoded = pcall(rapidjson.decode, text)
-    if ok then
-        local briefs = as_brief_array(decoded)
-        if briefs then return briefs end
-    end
+    if ok then return as_article_array(decoded) end
     return nil
 end
 
--- Structured outputs should make the first decode succeed. These fallbacks keep
--- Morning Paper resilient to providers that still wrap JSON in prose/code fences.
-local function decode_briefs(text)
+local function decode_articles(text)
     if type(text) ~= "string" then return nil end
+    local articles = try_decode(text)
+    if articles then return articles end
 
-    local briefs = try_decode(text)
-    if briefs then return briefs end
-
-    local stripped = text
-        :gsub("^%s*```[%w_%-]*%s*", "")
-        :gsub("%s*```%s*$", "")
-    briefs = try_decode(stripped)
-    if briefs then return briefs end
+    local stripped = text:gsub("^%s*```[%w_%-]*%s*", ""):gsub("%s*```%s*$", "")
+    articles = try_decode(stripped)
+    if articles then return articles end
 
     local first_obj = stripped:find("{", 1, true)
     local last_obj
@@ -244,8 +268,8 @@ local function decode_briefs(text)
         if stripped:sub(i, i) == "}" then last_obj = i break end
     end
     if first_obj and last_obj and last_obj >= first_obj then
-        briefs = try_decode(stripped:sub(first_obj, last_obj))
-        if briefs then return briefs end
+        articles = try_decode(stripped:sub(first_obj, last_obj))
+        if articles then return articles end
     end
 
     local first_arr = stripped:find("[", 1, true)
@@ -254,30 +278,23 @@ local function decode_briefs(text)
         if stripped:sub(i, i) == "]" then last_arr = i break end
     end
     if first_arr and last_arr and last_arr >= first_arr then
-        briefs = try_decode(stripped:sub(first_arr, last_arr))
-        if briefs then return briefs end
+        articles = try_decode(stripped:sub(first_arr, last_arr))
+        if articles then return articles end
     end
-
     return nil
 end
 
 local function make_request(api_key, model, user_prompt)
     local body = {
         model = model or DEFAULT_MODEL,
-        max_tokens = 6000,
+        max_tokens = 9000,
         messages = {
             { role = "system", content = SYSTEM_PROMPT },
             { role = "user", content = user_prompt },
         },
         response_format = RESPONSE_FORMAT,
-        plugins = {
-            { id = "response-healing" },
-        },
+        plugins = { { id = "response-healing" } },
     }
-
-    -- Claude 5 models reject sampling controls on some providers. The editorial
-    -- prompt + strict JSON schema already make this request deterministic enough,
-    -- so Morning Paper deliberately sends no temperature/top_p parameters.
 
     local encoded, encode_err = rapidjson.encode(body)
     if not encoded then return nil, "Could not encode AI request: " .. tostring(encode_err) end
@@ -309,7 +326,7 @@ local function make_request(api_key, model, user_prompt)
     if not response then return nil, "Could not decode OpenRouter response: " .. tostring(decode_err) end
     local choice = response.choices and response.choices[1]
     local content = choice and choice.message and choice.message.content
-    if type(content) ~= "string" or content == "" then return nil, "OpenRouter returned no briefing text" end
+    if type(content) ~= "string" or content == "" then return nil, "OpenRouter returned no newsroom text" end
     return content, nil, response.model, choice.finish_reason
 end
 
@@ -319,20 +336,20 @@ function AiBriefing.generate(opts)
     if not nonempty(api_key) then return nil, "No OpenRouter API key configured" end
 
     local reporting, agenda = build_material(opts.sections or {}, opts.section_order or {}, opts.agenda_items or {})
-    if reporting == "" then return nil, "No accessible reporting was available for AI synthesis" end
+    if reporting == "" then return nil, "No accessible reporting was available for AI newsroom synthesis" end
 
     local user_prompt = string.format([[
-Issue: %s
-Edition generated: %s
+EDITION DATE: %s
+GENERATED: %s
 
-ACCESSIBLE REPORTING
+NEWSROOM RESEARCH PACKET
 %s
 
 WSJ / EDITORIAL AGENDA SIGNALS
-The following are public headline/feed signals only. Do not treat them as evidence for details that are not present in ACCESSIBLE REPORTING.
+These are public headline/feed signals only. They can help identify consequential topics but are not evidence for undisclosed article details.
 %s
 
-Create the Intelligence Desk now.]],
+Produce today's complete MORNING PAPER editorial edition now.]],
         tostring(opts.nice_date or opts.date or "Today"),
         tostring(opts.edition_time or "morning"),
         reporting,
@@ -343,44 +360,48 @@ Create the Intelligence Desk now.]],
     local content, err, model_used, finish_reason = make_request(api_key, selected_model, user_prompt)
     if not content then return nil, err end
 
-    local decoded = decode_briefs(content)
+    local decoded = decode_articles(content)
     if type(decoded) ~= "table" then
         if finish_reason == "length" then
-            return nil, "AI briefing was truncated before the structured response completed"
+            return nil, "AI newsroom edition was truncated before the structured response completed"
         end
-        return nil, "AI returned an unusable structured briefing response"
+        return nil, "AI returned an unusable structured newsroom response"
     end
 
-    local out = {}
-    for _, brief in ipairs(decoded) do
-        if type(brief) == "table" and nonempty(brief.title) and nonempty(brief.body) then
-            local sources = {}
-            if type(brief.sources) == "table" then
-                for _, source in ipairs(brief.sources) do
-                    if nonempty(source) then sources[#sources + 1] = tostring(source) end
+    local sections = {}
+    local count = 0
+    for _, article in ipairs(decoded) do
+        if type(article) == "table" and ALLOWED_SECTIONS[article.section]
+            and nonempty(article.title) and nonempty(article.body) then
+            local source_names = {}
+            if type(article.sources) == "table" then
+                for _, source in ipairs(article.sources) do
+                    if nonempty(source) then source_names[#source_names + 1] = tostring(source) end
                 end
             end
-            local body_text = tostring(brief.body)
-            if #sources > 0 then body_text = body_text .. "\n\nSOURCES: " .. table.concat(sources, "; ") end
-            out[#out + 1] = {
-                title = tostring(brief.title),
-                source = "Morning Paper Intelligence Desk",
+            local body_text = tostring(article.body)
+            if #source_names > 0 then
+                body_text = body_text .. "\n\nReporting used: " .. table.concat(source_names, "; ")
+            end
+            sections[article.section] = sections[article.section] or {}
+            sections[article.section][#sections[article.section] + 1] = {
+                title = tostring(article.title),
+                source = "Morning Paper Newsroom",
                 date = os.date("%a, %d %b %Y %H:%M:%S %z"),
-                published_epoch = os.time(),
-                content_mode = "AI multi-source synthesis · " .. tostring(model_used or selected_model or DEFAULT_MODEL),
+                published_epoch = os.time() - count,
+                content_mode = "AI-enhanced multi-source reporting · " .. tostring(model_used or selected_model or DEFAULT_MODEL),
                 body = body_text,
                 link = "",
             }
-            if #out >= 8 then break end
+            count = count + 1
+            if count >= 14 then break end
         end
     end
 
-    if #out == 0 then return nil, "AI produced no usable multi-source briefs" end
-    return out, nil, model_used or selected_model
+    if count == 0 then return nil, "AI produced no usable Morning Paper articles" end
+    return sections, nil, model_used or selected_model, count
 end
 
--- Migration: if Morning Paper is still on the original free-router default and
--- KOAssistant is currently using OpenRouter, mirror KOAssistant's chosen model.
 if G_reader_settings then
     local current = G_reader_settings:readSetting("morningpaper_ai_model", DEFAULT_MODEL)
     if not nonempty(current) or current == DEFAULT_MODEL then
