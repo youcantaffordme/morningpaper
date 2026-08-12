@@ -16,8 +16,8 @@ local MorningPaper = WidgetContainer:extend{
 }
 
 local MONTHS = {
-    Jan = 1, Feb = 2, Mar = 3, Apr = 4, May = 5, Jun = 6,
-    Jul = 7, Aug = 8, Sep = 9, Oct = 10, Nov = 11, Dec = 12,
+    Jan=1, Feb=2, Mar=3, Apr=4, May=5, Jun=6,
+    Jul=7, Aug=8, Sep=9, Oct=10, Nov=11, Dec=12,
 }
 
 local SECTION_ORDER = {
@@ -26,12 +26,12 @@ local SECTION_ORDER = {
 }
 
 local DELIVERY_TIMES = {
-    { label = "5:30 AM", hour = 5, minute = 30 },
-    { label = "6:00 AM", hour = 6, minute = 0 },
-    { label = "6:30 AM", hour = 6, minute = 30 },
-    { label = "7:00 AM", hour = 7, minute = 0 },
-    { label = "7:30 AM", hour = 7, minute = 30 },
-    { label = "8:00 AM", hour = 8, minute = 0 },
+    { label="5:30 AM", hour=5, minute=30 },
+    { label="6:00 AM", hour=6, minute=0 },
+    { label="6:30 AM", hour=6, minute=30 },
+    { label="7:00 AM", hour=7, minute=0 },
+    { label="7:30 AM", hour=7, minute=30 },
+    { label="8:00 AM", hour=8, minute=0 },
 }
 
 local function safe_mkdir(path)
@@ -43,51 +43,34 @@ local function html_escape(s)
     return s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;")
 end
 
-local function utf8_char(code)
-    if not code or code < 0 then return "" end
-    if code <= 0x7F then
-        return string.char(code)
-    elseif code <= 0x7FF then
-        return string.char(0xC0 + math.floor(code / 0x40), 0x80 + (code % 0x40))
-    elseif code <= 0xFFFF then
-        return string.char(0xE0 + math.floor(code / 0x1000), 0x80 + (math.floor(code / 0x40) % 0x40), 0x80 + (code % 0x40))
-    end
-    return ""
+local function raw_tag(block, name)
+    local value = block:match("<" .. name .. "[^>]*>(.-)</" .. name .. ">")
+    if not value then return "" end
+    value = value:gsub("<!%[CDATA%[(.-)%]%]>", "%1")
+    return value
 end
 
-local function decode_entities(s)
-    s = tostring(s or "")
-    s = s:gsub("&#x([0-9A-Fa-f]+);", function(hex) return utf8_char(tonumber(hex, 16)) end)
-    s = s:gsub("&#([0-9]+);", function(dec) return utf8_char(tonumber(dec, 10)) end)
-    local entities = {
-        amp="&", lt="<", gt=">", quot='"', apos="'", nbsp=" ",
-        ndash="–", mdash="—", rsquo="’", lsquo="‘", rdquo="”", ldquo="“", hellip="…",
-    }
-    return s:gsub("&([%a]+);", function(name) return entities[name] or "&" .. name .. ";" end)
+local function clean_tag(block, name)
+    return ArticleFetcher.cleanText(raw_tag(block, name))
 end
 
-local function strip_tags(s)
-    s = tostring(s or "")
-    s = s:gsub("<!%[CDATA%[(.-)%]%]>", "%1")
-    s = s:gsub("<script.-</script>", " "):gsub("<style.-</style>", " "):gsub("<[^>]->", " ")
-    s = decode_entities(s):gsub("%s+", " ")
-    return s:gsub("^%s+", ""):gsub("%s+$", "")
-end
-
-local function tag(block, name)
-    local a = block:match("<" .. name .. "[^>]*>(.-)</" .. name .. ">")
-    return a and strip_tags(a) or ""
+local function decode_link(s)
+    s = tostring(s or ""):gsub("<!%[CDATA%[(.-)%]%]>", "%1")
+    s = s:gsub("&amp;", "&"):gsub("&#38;", "&"):gsub("&quot;", '"')
+    s = s:gsub("^%s+", ""):gsub("%s+$", "")
+    return s
 end
 
 local function parse_rss(xml, limit)
     local out = {}
     for item in xml:gmatch("<item.-</item>") do
-        local title = tag(item, "title")
-        local link = tag(item, "link")
-        local desc = tag(item, "description")
-        if desc == "" then desc = tag(item, "content:encoded") end
+        local title = clean_tag(item, "title")
+        local link = decode_link(raw_tag(item, "link"))
+        local desc = ArticleFetcher.cleanText(raw_tag(item, "description"))
+        if desc == "" then desc = ArticleFetcher.cleanText(raw_tag(item, "content:encoded")) end
+        local date = clean_tag(item, "pubDate")
         if title ~= "" then
-            out[#out + 1] = { title=title, link=link, description=desc, date=tag(item, "pubDate") }
+            out[#out + 1] = { title=title, link=link, description=desc, date=date }
             if #out >= limit then break end
         end
     end
@@ -97,12 +80,17 @@ end
 local function parse_atom(xml, limit)
     local out = {}
     for entry in xml:gmatch("<entry.-</entry>") do
-        local title = tag(entry, "title")
-        local summary = tag(entry, "summary")
-        if summary == "" then summary = tag(entry, "content") end
+        local title = clean_tag(entry, "title")
+        local summary = ArticleFetcher.cleanText(raw_tag(entry, "summary"))
+        if summary == "" then summary = ArticleFetcher.cleanText(raw_tag(entry, "content")) end
         local link = entry:match("<link[^>]-href=\"(.-)\"") or entry:match("<link[^>]-href='(.-)'") or ""
         if title ~= "" then
-            out[#out + 1] = { title=title, link=decode_entities(link), description=summary, date=tag(entry, "updated") }
+            out[#out + 1] = {
+                title=title,
+                link=decode_link(link),
+                description=summary,
+                date=clean_tag(entry, "updated"),
+            }
             if #out >= limit then break end
         end
     end
@@ -125,11 +113,9 @@ local function parse_zone_offset(zone)
     zone = zone:upper()
     if zone == "GMT" or zone == "UTC" or zone == "UT" or zone == "Z" then return 0 end
     local sign, hh, mm = zone:match("^([%+%-])(%d%d)(%d%d)$")
-    if sign then
-        local seconds = tonumber(hh) * 3600 + tonumber(mm) * 60
-        return sign == "-" and -seconds or seconds
-    end
-    return nil
+    if not sign then return nil end
+    local seconds = tonumber(hh) * 3600 + tonumber(mm) * 60
+    return sign == "-" and -seconds or seconds
 end
 
 local function make_epoch(year, mon, day, hour, min, sec, zone)
@@ -139,9 +125,7 @@ local function make_epoch(year, mon, day, hour, min, sec, zone)
     }
     if not naive then return nil end
     local zone_offset = parse_zone_offset(zone)
-    if zone_offset ~= nil then
-        return naive + local_utc_offset(naive) - zone_offset
-    end
+    if zone_offset ~= nil then return naive + local_utc_offset(naive) - zone_offset end
     return naive
 end
 
@@ -152,20 +136,14 @@ local function parse_date_epoch(s)
     if not day then
         day, mon, year, hour, min, sec, zone = s:match("(%d%d?)%s+(%a%a%a)%s+(%d%d%d%d)%s+(%d%d):(%d%d):(%d%d)%s*(%a+)")
     end
-    if day and MONTHS[mon] then
-        return make_epoch(year, MONTHS[mon], day, hour, min, sec, zone)
-    end
+    if day and MONTHS[mon] then return make_epoch(year, MONTHS[mon], day, hour, min, sec, zone) end
 
     year, mon, day, hour, min, sec, zone = s:match("(%d%d%d%d)%-(%d%d)%-(%d%d)[T%s](%d%d):(%d%d):(%d%d)([Zz])")
     if year then return make_epoch(year, mon, day, hour, min, sec, zone) end
 
-    year, mon, day, hour, min, sec, zone = s:match("(%d%d%d%d)%-(%d%d)%-(%d%d)[T%s](%d%d):(%d%d):(%d%d)([%+%-]%d%d):?(%d%d)")
-    if year then
-        local z = zone
-        local zmin = s:match("[%+%-]%d%d:?(%d%d)$")
-        if z and zmin then z = z .. zmin end
-        return make_epoch(year, mon, day, hour, min, sec, z)
-    end
+    local zhour, zmin
+    year, mon, day, hour, min, sec, zhour, zmin = s:match("(%d%d%d%d)%-(%d%d)%-(%d%d)[T%s](%d%d):(%d%d):(%d%d)([%+%-]%d%d):?(%d%d)")
+    if year then return make_epoch(year, mon, day, hour, min, sec, zhour .. zmin) end
 
     year, mon, day, hour, min, sec = s:match("(%d%d%d%d)%-(%d%d)%-(%d%d)[T%s](%d%d):(%d%d):?(%d%d?)")
     if year then return make_epoch(year, mon, day, hour, min, sec, nil) end
@@ -192,7 +170,7 @@ local function http_get(url)
         url=url,
         sink=ltn12.sink.table(chunks),
         headers={
-            ["User-Agent"]="KOReader MorningPaper/0.3",
+            ["User-Agent"]="KOReader MorningPaper/0.3.1",
             ["Accept"]="application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
         },
     }
@@ -206,14 +184,15 @@ local function http_get(url)
 end
 
 local function text_to_html(text)
-    if not text or text == "" then return "" end
+    local clean = ArticleFetcher.cleanText(text)
+    if clean == "" then return "" end
     local out = {}
-    local normalized = text:gsub("\r\n", "\n"):gsub("\r", "\n") .. "\n\n"
+    local normalized = clean:gsub("\r\n", "\n"):gsub("\r", "\n") .. "\n\n"
     for para in normalized:gmatch("(.-)\n%s*\n") do
         para = para:gsub("^%s+", ""):gsub("%s+$", "")
         if para ~= "" then out[#out + 1] = "<p>" .. html_escape(para) .. "</p>" end
     end
-    if #out == 0 then out[1] = "<p>" .. html_escape(text) .. "</p>" end
+    if #out == 0 then out[1] = "<p>" .. html_escape(clean) .. "</p>" end
     return table.concat(out, "\n")
 end
 
@@ -224,9 +203,7 @@ local function seconds_until(hour, minute)
         year=t.year, month=t.month, day=t.day,
         hour=hour, min=minute, sec=0,
     }
-    if target <= now + 30 then
-        target = target + 24 * 60 * 60
-    end
+    if target <= now + 30 then target = target + 24 * 60 * 60 end
     return math.max(60, target - now), target
 end
 
@@ -267,7 +244,6 @@ function MorningPaper:scheduleAutoDelivery(remove_existing)
         self.auto_next_epoch = nil
         return false
     end
-
     if remove_existing ~= false and self.auto_callback then
         pcall(function() Device.wakeup_mgr:removeTasks(nil, self.auto_callback) end)
     end
@@ -275,7 +251,6 @@ function MorningPaper:scheduleAutoDelivery(remove_existing)
         self.auto_next_epoch = nil
         return true
     end
-
     local delay, target = seconds_until(self.auto_hour, self.auto_minute)
     self.auto_next_epoch = target
     Device.wakeup_mgr:addTask(delay, self.auto_callback)
@@ -300,17 +275,13 @@ end
 
 function MorningPaper:autoStatusText()
     local enabled = self.auto_enabled and "ON" or "OFF"
-    local delivery = os.date("%I:%M %p", os.time{ year=2000, month=1, day=1, hour=self.auto_hour, min=self.auto_minute, sec=0 }):gsub("^0", "")
+    local delivery = os.date("%I:%M %p", os.time{year=2000, month=1, day=1, hour=self.auto_hour, min=self.auto_minute, sec=0}):gsub("^0", "")
     local next_text = self.auto_next_epoch and os.date("%a %b %d, %I:%M %p", self.auto_next_epoch):gsub(" 0", " ") or "Not scheduled"
     return string.format("Auto delivery: %s\nDelivery time: %s\nNext delivery: %s\nLast result: %s", enabled, delivery, next_text, self.last_auto_status or "Unknown")
 end
 
 function MorningPaper:onAutoDeliveryWake()
     if not self.auto_enabled then return end
-
-    -- Queue tomorrow before doing network work. During an RTC wake callback the
-    -- current task is still in WakeupMgr's queue, so we deliberately do NOT
-    -- remove existing tasks here; WakeupMgr removes today's task after we return.
     self:scheduleAutoDelivery(false)
 
     local wifi_was_on = NetworkMgr:getWifiState() and true or false
@@ -323,7 +294,7 @@ function MorningPaper:onAutoDeliveryWake()
     end
 
     local function run()
-        local ok, result = pcall(function() return self:buildPaper{ automatic=true } end)
+        local ok, result = pcall(function() return self:buildPaper{automatic=true} end)
         if ok and result then
             finish("Delivered " .. os.date("%Y-%m-%d %H:%M"))
         elseif ok then
@@ -333,12 +304,8 @@ function MorningPaper:onAutoDeliveryWake()
         end
     end
 
-    -- goOnlineToRun is the unattended-safe KOReader path: it will only turn
-    -- Wi-Fi on automatically when the user's Wi-Fi action is configured to do so.
     local started = NetworkMgr:goOnlineToRun(run)
-    if not started then
-        finish("Could not auto-enable Wi-Fi; set KOReader Wi-Fi action to Turn on")
-    end
+    if not started then finish("Could not auto-enable Wi-Fi; set KOReader Wi-Fi action to Turn on") end
 end
 
 function MorningPaper:onCloseWidget()
@@ -350,12 +317,12 @@ end
 function MorningPaper:latestPath()
     local best, best_mtime
     if lfs.attributes(self.output_dir, "mode") ~= "directory" then return nil end
-    for f in lfs.dir(self.output_dir) do
-        if f:match("^Morning Paper %d%d%d%d%-%d%d%-%d%d%.html$") then
-            local p = self.output_dir .. "/" .. f
-            local a = lfs.attributes(p)
-            if a and (not best_mtime or a.modification > best_mtime) then
-                best, best_mtime = p, a.modification
+    for file in lfs.dir(self.output_dir) do
+        if file:match("^Morning Paper %d%d%d%d%-%d%d%-%d%d%.html$") then
+            local path = self.output_dir .. "/" .. file
+            local attrs = lfs.attributes(path)
+            if attrs and (not best_mtime or attrs.modification > best_mtime) then
+                best, best_mtime = path, attrs.modification
             end
         end
     end
@@ -363,13 +330,13 @@ function MorningPaper:latestPath()
 end
 
 function MorningPaper:openLatest()
-    local p = self:latestPath()
-    if not p then
+    local path = self:latestPath()
+    if not path then
         UIManager:show(InfoMessage:new{ text=_("No Morning Paper issue exists yet. Refresh today's paper first.") })
         return
     end
     self.ui:onClose()
-    require("apps/reader/readerui"):showReader(p)
+    require("apps/reader/readerui"):showReader(path)
 end
 
 function MorningPaper:buildPaper(opts)
@@ -380,7 +347,7 @@ function MorningPaper:buildPaper(opts)
     end
 
     local sections, seen, failures = {}, {}, {}
-    local total, full_count, excerpt_count, stale_count = 0, 0, 0, 0
+    local total, full_count, excerpt_count, stale_count, clean_fallback_count = 0, 0, 0, 0, 0
     local article_counter = 0
 
     for _, src in ipairs(self.sources) do
@@ -402,12 +369,12 @@ function MorningPaper:buildPaper(opts)
                         item.source = src.name
                         item.published_epoch = parse_date_epoch(item.date) or 0
                         item.content_mode = "Feed excerpt"
-                        item.body = item.description
+                        item.body = ArticleFetcher.cleanText(item.description)
 
                         if src.full_text ~= false and item.link ~= "" then
-                            local body, mode, final_url = ArticleFetcher.fetch(item.link, { min_chars=src.min_fulltext_chars or 350 })
-                            if body then
-                                item.body = body
+                            local body, mode, final_url = ArticleFetcher.fetch(item.link, {min_chars=src.min_fulltext_chars or 350})
+                            if body and body ~= "" then
+                                item.body = ArticleFetcher.cleanText(body)
                                 item.content_mode = "Full article"
                                 item.extract_mode = mode
                                 item.link = final_url or item.link
@@ -415,9 +382,17 @@ function MorningPaper:buildPaper(opts)
                             else
                                 item.extract_error = mode
                                 excerpt_count = excerpt_count + 1
+                                clean_fallback_count = clean_fallback_count + 1
                             end
                         else
                             excerpt_count = excerpt_count + 1
+                        end
+
+                        -- Final safety pass: raw HTML, hrefs and giant tracking URLs never reach the paper.
+                        item.body = ArticleFetcher.cleanText(item.body)
+                        if item.body == "" or #item.body < 60 then
+                            item.body = "A clean full-text copy was not available from this publisher. Use “Open original article” below to read it on the source site."
+                            item.content_mode = "Source link only"
                         end
 
                         sections[src.section][#sections[src.section] + 1] = item
@@ -430,9 +405,6 @@ function MorningPaper:buildPaper(opts)
         end
     end
 
-    -- Publisher feeds are often editorially ordered instead of chronological.
-    -- Keep their raw timestamps (including UTC/GMT "tomorrow" dates), but make
-    -- the newspaper itself newest-first inside every section.
     for _, section in ipairs(SECTION_ORDER) do
         local items = sections[section]
         if items then
@@ -454,13 +426,14 @@ function MorningPaper:buildPaper(opts)
     f:write([[<!doctype html><html><head><meta charset="utf-8"><title>Morning Paper</title><style>
 body{font-family:serif;line-height:1.5;max-width:48em;margin:auto;padding:1.2em}h1{font-size:2em;margin-bottom:.1em}h2{margin-top:2em;border-bottom:1px solid #777;padding-bottom:.2em}h3{font-size:1.35em}.article{margin:1.5em 0 2.4em}.meta{font-size:.85em}.mode{font-size:.82em;font-style:italic}.toc a{text-decoration:none}.original{font-size:.9em}.rule{border-top:1px solid #aaa;margin-top:2em}</style></head><body>]])
     f:write("<h1>Morning Paper</h1><p><strong>" .. html_escape(os.date("%A, %B %d, %Y")) .. "</strong></p>")
-    f:write("<p>" .. total .. " current stories · " .. full_count .. " full articles fetched · " .. excerpt_count .. " feed excerpts</p>")
+    f:write("<p>" .. total .. " current stories · " .. full_count .. " full articles fetched · " .. excerpt_count .. " clean fallbacks</p>")
     f:write("<p><em>Newest stories are listed first. Publisher timestamps are preserved as supplied, including GMT/UTC dates that may be a day ahead of local time.</em></p>")
-    f:write("<p><em>Morning Paper uses publisher-provided feeds and publicly reachable article pages. It does not bypass subscriptions or paywalls.</em></p>")
+    f:write("<p><em>All displayed story text is sanitized before publishing: HTML tags, href fragments, tracking URLs, newsletter prompts and common page boilerplate are removed.</em></p>")
+    f:write("<p><em>Morning Paper does not bypass subscriptions, logins or paywalls.</em></p>")
     f:write("<h2>Contents</h2><div class='toc'><ul>")
     for _, section in ipairs(SECTION_ORDER) do
         if sections[section] and #sections[section] > 0 then
-            f:write("<li><a href='#" .. section:gsub("%W","") .. "'>" .. html_escape(section) .. "</a> (" .. #sections[section] .. ")</li>")
+            f:write("<li><a href='#" .. section:gsub("%W", "") .. "'>" .. html_escape(section) .. "</a> (" .. #sections[section] .. ")</li>")
         end
     end
     f:write("</ul></div>")
@@ -469,7 +442,7 @@ body{font-family:serif;line-height:1.5;max-width:48em;margin:auto;padding:1.2em}
     for _, section in ipairs(SECTION_ORDER) do
         local items = sections[section]
         if items and #items > 0 then
-            f:write("<h2 id='" .. section:gsub("%W","") .. "'>" .. html_escape(section) .. "</h2>")
+            f:write("<h2 id='" .. section:gsub("%W", "") .. "'>" .. html_escape(section) .. "</h2>")
             for _, item in ipairs(items) do
                 article_id = article_id + 1
                 f:write("<div class='article' id='story" .. article_id .. "'><h3>" .. html_escape(item.title) .. "</h3>")
@@ -478,11 +451,9 @@ body{font-family:serif;line-height:1.5;max-width:48em;margin:auto;padding:1.2em}
                 f:write("</div><div class='mode'>" .. html_escape(item.content_mode))
                 if item.content_mode ~= "Full article" and item.extract_error then f:write(" · " .. html_escape(item.extract_error)) end
                 f:write("</div>")
-                if item.body and item.body ~= "" then
-                    f:write(text_to_html(item.body))
-                else
-                    f:write("<p>No text was supplied by this source.</p>")
-                end
+
+                local rendered = text_to_html(item.body)
+                if rendered ~= "" then f:write(rendered) else f:write("<p>No clean text was available from this source.</p>") end
                 if item.link ~= "" then f:write("<p class='original'><a href='" .. html_escape(item.link) .. "'>Open original article</a></p>") end
                 f:write("<div class='rule'></div></div>")
             end
@@ -532,7 +503,7 @@ function MorningPaper:addToMainMenu(menu_items)
                 UIManager:show(InfoMessage:new{ text=self:autoStatusText() })
             end,
         },
-        { text=_("Delivery time") , separator=true },
+        { text=_("Delivery time"), separator=true },
     }
 
     for _, preset in ipairs(DELIVERY_TIMES) do
@@ -564,7 +535,7 @@ function MorningPaper:addToMainMenu(menu_items)
             {
                 text=_("About"),
                 callback=function()
-                    UIManager:show(InfoMessage:new{ text=_("Morning Paper 0.3 adds newest-first story ordering and optional hardware-wake morning delivery. Publisher GMT/UTC timestamps are intentionally preserved. Full article extraction remains best-effort and paywalls are not bypassed.") })
+                    UIManager:show(InfoMessage:new{ text=_("Morning Paper 0.3.1 sanitizes every article and feed fallback before rendering, removing raw HTML, href fragments, tracking URLs and common page boilerplate. Automatic hardware-wake delivery and publisher GMT/UTC timestamps remain supported. Paywalls are not bypassed.") })
                 end,
             },
         },
