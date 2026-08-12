@@ -54,6 +54,36 @@ function AiBriefing.findOpenRouterKey(explicit_key)
     return nil, "No OpenRouter key found"
 end
 
+-- Reuse KOAssistant's active OpenRouter model when Morning Paper is still on its
+-- default router. KOAssistant stores the active provider/model in features.provider
+-- and features.model, so this stays independent of KOAssistant internals/API code.
+function AiBriefing.findKOAssistantModel()
+    local settings_dir = DataStorage:getSettingsDir()
+    local ko_settings = load_lua_table(settings_dir .. "/koassistant_settings.lua")
+    if not ko_settings then return nil, "KOAssistant settings not found" end
+
+    local features = type(ko_settings.features) == "table" and ko_settings.features or {}
+    local provider = features.provider or ko_settings.provider
+    local model = features.model or ko_settings.model
+
+    if provider == "openrouter" and nonempty(model) then
+        return model, "KOAssistant current OpenRouter model"
+    end
+    if provider and provider ~= "openrouter" then
+        return nil, "KOAssistant is using " .. tostring(provider) .. ", not OpenRouter"
+    end
+    return nil, "KOAssistant OpenRouter model not found"
+end
+
+function AiBriefing.resolveModel(requested_model)
+    local requested = nonempty(requested_model) and requested_model or DEFAULT_MODEL
+    if requested == DEFAULT_MODEL then
+        local koa_model, source = AiBriefing.findKOAssistantModel()
+        if koa_model then return koa_model, source end
+    end
+    return requested, requested == DEFAULT_MODEL and "Morning Paper free router" or "Morning Paper model setting"
+end
+
 local function clip(s, n)
     s = tostring(s or ""):gsub("%s+", " ")
     if #s <= n then return s end
@@ -228,7 +258,8 @@ Create the Intelligence Desk now.]],
         agenda ~= "" and agenda or "No fresh WSJ agenda signals were available."
     )
 
-    local content, err, model_used = make_request(api_key, opts.model or DEFAULT_MODEL, user_prompt)
+    local selected_model = AiBriefing.resolveModel(opts.model)
+    local content, err, model_used = make_request(api_key, selected_model, user_prompt)
     if not content then return nil, err end
 
     local json_text = extract_json_array(content)
@@ -252,7 +283,7 @@ Create the Intelligence Desk now.]],
                 source = "Morning Paper Intelligence Desk",
                 date = os.date("%a, %d %b %Y %H:%M:%S %z"),
                 published_epoch = os.time(),
-                content_mode = "AI multi-source synthesis · " .. tostring(model_used or opts.model or DEFAULT_MODEL),
+                content_mode = "AI multi-source synthesis · " .. tostring(model_used or selected_model or DEFAULT_MODEL),
                 body = body,
                 link = "",
             }
@@ -261,7 +292,21 @@ Create the Intelligence Desk now.]],
     end
 
     if #out == 0 then return nil, "AI produced no usable multi-source briefs" end
-    return out, nil, model_used
+    return out, nil, model_used or selected_model
+end
+
+-- v0.5.1 migration: if Morning Paper is still on the original free-router default
+-- and KOAssistant is currently using OpenRouter, mirror KOAssistant's model so the
+-- status screen and next paper immediately reflect the reader's chosen model.
+if G_reader_settings then
+    local current = G_reader_settings:readSetting("morningpaper_ai_model", DEFAULT_MODEL)
+    if not nonempty(current) or current == DEFAULT_MODEL then
+        local koa_model = AiBriefing.findKOAssistantModel()
+        if koa_model then
+            G_reader_settings:saveSetting("morningpaper_ai_model", koa_model)
+            G_reader_settings:flush()
+        end
+    end
 end
 
 AiBriefing.DEFAULT_MODEL = DEFAULT_MODEL
