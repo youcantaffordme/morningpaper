@@ -1,6 +1,7 @@
--- v0.8 keeps the stable v0.7 UI/build pipeline but wraps its newsroom engine
--- with the Coverage Net before main_v07 is loaded.
-local BaseNewsroom = require("newsroom_v07")
+-- v0.8 keeps the stable v0.7 UI/build pipeline but swaps in the Coverage Net
+-- newsroom engine before main_v07 is loaded.
+-- newsroom_v08 already returns the wrapped newsroom table, so do not call a
+-- nonexistent .wrap() helper here (that prevented the plugin from loading).
 local CoverageNet = require("newsroom_v08")
-package.loaded["newsroom_v07"] = CoverageNet.wrap(BaseNewsroom)
+package.loaded["newsroom_v07"] = CoverageNet
 return require("main_v07")
