@@ -26,8 +26,8 @@ local function clone_sections(sections)
 end
 
 local STOP = {
-    the=true, a=true, an=true, and=true, or=true, but=true, of=true, for=true, to=true,
-    in=true, on=true, at=true, by=true, with=true, from=true, as=true, is=true, are=true,
+    the=true, a=true, an=true, ["and"]=true, ["or"]=true, but=true, of=true, ["for"]=true, to=true,
+    ["in"]=true, on=true, at=true, by=true, with=true, from=true, as=true, is=true, are=true,
     was=true, were=true, be=true, been=true, being=true, this=true, that=true, these=true,
     those=true, it=true, its=true, their=true, his=true, her=true, says=true, say=true,
     after=true, before=true, amid=true, over=true, into=true, about=true, new=true,
