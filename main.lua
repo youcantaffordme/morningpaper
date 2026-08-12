@@ -4,8 +4,10 @@
 -- 2) Add a separate FRESH PAYWALL LEAD NETWORK. These entries are agenda-only:
 --    they tell the editor what major subscription publications are emphasizing,
 --    but their hidden text is never fetched or reconstructed.
--- 3) Coverage Net matches those leads to accessible reporting of the same event,
---    boosts corroborated lead-backed events, and hands event packets to Sonnet.
+-- 3) Coverage Net matches those leads to accessible reporting of the same event.
+-- 4) The Lead-First wrapper keeps those paywall signals at the top of the actual
+--    editorial agenda, so major subscription headlines can drive Front Page
+--    selection while public corroboration supplies the factual reporting.
 
 local ok_sources, sources = pcall(require, "sources")
 local ok_scans, scans = pcall(require, "coverage_scans")
@@ -20,6 +22,5 @@ if ok_sources and type(sources) == "table" then
     end
 end
 
--- Patch the stable newsroom in place with event-level Wide Coverage Net logic.
-require("newsroom_v09")
+require("newsroom_v11")
 return require("main_v07")
