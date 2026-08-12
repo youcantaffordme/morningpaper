@@ -42,6 +42,19 @@ if ok_sources and type(sources) == "table" then
     if ok_leads then injected_leads = append_unique(sources, leads) end
 end
 
+local configured_editorial_leads, configured_coverage_scans = 0, 0
+if ok_sources and type(sources) == "table" then
+    for _, src in ipairs(sources) do
+        if src and src.agenda_only then
+            if tostring(src.name or ""):find("[Coverage Scan]", 1, true) then
+                configured_coverage_scans = configured_coverage_scans + 1
+            else
+                configured_editorial_leads = configured_editorial_leads + 1
+            end
+        end
+    end
+end
+
 -- Load the consensus newsroom before main_v07 captures newsroom_v07. If this
 -- enhancement ever fails, Morning Paper still loads and exposes the failure in
 -- Runtime & system check instead of silently disappearing from KOReader.
@@ -238,7 +251,10 @@ end
 
 function Base:runtimeDiagnosticsText()
     local wake = Device.wakeup_mgr and "available" or "NOT AVAILABLE"
-    local lead_state = lead_runtime_ok and "loaded" or ("ERROR: " .. tostring(lead_runtime_error or "unknown"))
+    local lead_version = lead_runtime_ok and type(lead_runtime) == "table"
+        and tostring(lead_runtime.CONSENSUS_LEAD_DESK_VERSION or "loaded") or nil
+    local lead_state = lead_runtime_ok and ("loaded · " .. lead_version)
+        or ("ERROR: " .. tostring(lead_runtime_error or "unknown"))
     local source_state
     if ok_sources and type(sources) == "table" then
         source_state = tostring(#sources) .. " configured sources"
@@ -251,8 +267,10 @@ function Base:runtimeDiagnosticsText()
         "Menu engine: direct core cadence wiring",
         "Wake scheduler: " .. wake,
         "Consensus Lead Desk: " .. lead_state,
-        "Coverage scan definitions injected: " .. tostring(injected_scans),
-        "Paywall lead definitions injected: " .. tostring(injected_leads),
+        "Coverage scan feeds configured: " .. tostring(configured_coverage_scans),
+        "Editorial/paywall lead feeds configured: " .. tostring(configured_editorial_leads),
+        "New coverage definitions injected this load: " .. tostring(injected_scans),
+        "New paywall lead definitions injected this load: " .. tostring(injected_leads),
         "Research pool: " .. source_state,
         "",
         self:autoStatusText(),
