@@ -190,7 +190,8 @@ function MorningPaper:addToMainMenu(menu_items)
         }
     end
 
-    menu_items.morning_paper.sub_item_table[3] = {
+    local submenu = menu_items.morning_paper.sub_item_table
+    submenu[3] = {
         text=_("Automatic delivery"),
         sub_item_table={
             { text=_("Frequency"), sub_item_table=frequency },
@@ -200,6 +201,12 @@ function MorningPaper:addToMainMenu(menu_items)
                 UIManager:show(InfoMessage:new{ text=self:autoStatusText() })
             end },
         },
+    }
+    submenu[6] = {
+        text=_("About"),
+        callback=function()
+            UIManager:show(InfoMessage:new{ text=_("Morning Paper 0.12 is a consensus lead-first AI newspaper. Public headline signals from major subscription publications are grouped by event and ranked by cross-publication emphasis; accessible reporting supplies the factual evidence. The biggest corroborated lead-driven stories compete for Front Page first, then flow through World, U.S., Business & Markets, Technology & AI, Science, and Culture. Automatic delivery can run every morning, weekdays, once a week on a chosen day, or manually. Morning Paper never bypasses paywalls.") })
+        end,
     }
 end
 
