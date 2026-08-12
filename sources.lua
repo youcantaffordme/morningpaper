@@ -1,4 +1,4 @@
--- Morning Paper source pack (v0.2)
+-- Morning Paper source pack (v0.4.1)
 -- enabled=false keeps a source available without using it by default.
 -- limit controls how many current stories are considered from each feed.
 -- max_age_hours filters dated items so stale feeds do not fill the paper.
@@ -29,6 +29,43 @@ return {
         max_age_hours = 72,
         full_text = true,
     },
+
+    -- Official Epoch Times RSS feeds. These are public feeds published by
+    -- The Epoch Times itself. Morning Paper only uses publicly supplied feed
+    -- content / publicly accessible article pages and does not bypass login or paywalls.
+    {
+        section = "U.S.",
+        name = "The Epoch Times — U.S.",
+        url = "https://feed.theepochtimes.com/us/feed",
+        limit = 3,
+        max_age_hours = 72,
+        full_text = true,
+    },
+    {
+        section = "World",
+        name = "The Epoch Times — World",
+        url = "https://feed.theepochtimes.com/world/feed",
+        limit = 2,
+        max_age_hours = 72,
+        full_text = true,
+    },
+    {
+        section = "Business & Markets",
+        name = "The Epoch Times — Business & Markets",
+        url = "https://feed.theepochtimes.com/business/feed",
+        limit = 2,
+        max_age_hours = 96,
+        full_text = true,
+    },
+    {
+        section = "Technology & AI",
+        name = "The Epoch Times — Tech",
+        url = "https://feed.theepochtimes.com/tech/feed",
+        limit = 2,
+        max_age_hours = 96,
+        full_text = true,
+    },
+
     {
         section = "Business & Markets",
         name = "BBC News — Business",
