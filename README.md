@@ -1,115 +1,45 @@
 # Morning Paper for KOReader
 
-A Kindle/KOReader-first personal newspaper plugin.
+A Kindle/KOReader-first personal newspaper plugin that turns accessible reporting from many outlets into a dated, automatically delivered EPUB.
 
-## v0.5.0 — Intelligence Desk
-Morning Paper now has an optional **AI Intelligence Desk** at the front of each issue.
+## v0.7.0 — full AI newsroom
 
-The goal is not to imitate or reconstruct any publisher. The desk takes the public reporting Morning Paper already fetched from multiple outlets and creates a short set of original, source-grounded briefs that explain:
+Morning Paper now treats source articles as a **newsroom research packet**, not as the finished newspaper.
 
-- **FACTS** — what the accessible reporting actually establishes,
-- **WHY IT MATTERS** — economic, political, business, technological, security or everyday consequences,
-- **WHERE COVERAGE DIFFERS** — materially different interpretations or disputed claims,
-- **WATCH NEXT** — the next event, data point, decision or dependency that could change the story.
+When the AI newsroom is enabled, the plugin:
 
-The prompt explicitly tells the model not to force false balance: facts remain facts, claims remain claims, and disagreements are identified rather than blended together.
+1. fetches fresh RSS/Atom stories,
+2. attempts to extract clean publicly accessible article text,
+3. filters stale or malformed feed entries,
+4. collects fresh public WSJ headline feeds as **agenda signals only**,
+5. runs a separate editorial pass for Front Page and each major desk,
+6. compares overlapping reporting and writes original Morning Paper stories,
+7. publishes the finished stories into the normal newspaper sections,
+8. moves the underlying source references into a compact **Sources & Further Reading** appendix,
+9. packages everything into a dated EPUB with a generated newspaper cover and full table of contents.
 
-### WSJ agenda signals without copying paid WSJ
-Morning Paper now checks the public WSJ RSS headline feeds for World News, U.S. Business, Markets, Technology/What's News, Opinion and Lifestyle.
+The main paper is no longer an RSS reader with an AI summary bolted on top.
 
-These entries are **agenda-only**. They tell the Intelligence Desk which topics WSJ is emphasizing that day, but Morning Paper does **not** treat the headline as the hidden article, reconstruct a paywalled article, or bypass WSJ subscription controls. If a legacy WSJ feed is stale, the normal freshness filter excludes it automatically.
+### Editorial standard
 
-The AI then looks for those topics in the accessible reporting already collected from the rest of the source pool. A topic is supposed to be omitted rather than invented when the supplied reporting does not support it.
+Morning Paper asks the newsroom model to be:
 
-### Wider viewpoint mix
-The default source pool now includes BBC, The Guardian, Fox News, The Epoch Times, Ars Technica and primary economic sources including the Federal Reserve and Bureau of Labor Statistics. The raw source articles remain in their normal sections underneath the Intelligence Desk, so the reader can compare the synthesis with the underlying reporting.
+- fact-first,
+- multi-source,
+- evidence-weighted,
+- politically nonaligned,
+- explicit about uncertainty,
+- aware of meaningful differences in framing,
+- unwilling to manufacture false left/right symmetry.
 
-### AI cost and setup
-The default model is **`openrouter/free`**, so the synthesis itself can run on OpenRouter's free-model router. An OpenRouter API key is still required.
+A finished story should naturally explain what happened, what is firmly established, why it matters now, the context needed to understand it, how it may affect the current political/social/economic climate when supported by the research, where credible interpretations differ, what remains uncertain, and what to watch next.
 
-Morning Paper first tries its own saved OpenRouter key. If none is set, it tries to reuse an OpenRouter key already configured in KOAssistant. You can also set one directly at:
+The newsroom is told to use only the supplied research packet. It does not browse or invent missing facts.
 
-**Tools → Morning Paper → AI Intelligence Desk → Set OpenRouter API key**
+## Full newspaper structure
 
-AI synthesis is one request per generated issue, not one request per article. If the AI request fails or no key exists, Morning Paper still builds the ordinary source newspaper.
+A successful AI edition keeps the familiar newspaper sections:
 
-The AI request contains short excerpts of the public reporting Morning Paper already downloaded plus public WSJ headline/feed signals. It does not send your books, highlights or personal reading data.
-
-## v0.4 — real daily EPUB editions with covers
-Morning Paper generates each daily issue as a **real EPUB** rather than a plain HTML document.
-
-Every issue gets its own dynamically generated black-and-white newspaper cover containing:
-- **MORNING PAPER** masthead,
-- the issue date,
-- the edition time,
-- up to three leading headlines from that issue,
-- story/full-article counts,
-- a newspaper-style section footer.
-
-The cover is embedded in EPUB metadata as the book cover, so KOReader can use it in cover/grid views. The first page of the EPUB is also the full cover.
-
-Daily files are named like:
-
-`Morning Paper 2026-08-12.epub`
-
-When a new EPUB is successfully built, an old same-day HTML version is removed so the library does not show duplicate editions.
-
-The EPUB is built completely on-device with no Calibre, server, image API, or AI image generation required. Morning Paper includes its own lightweight ZIP/EPUB writer and generates the cover as scalable black-and-white SVG optimized for e-ink.
-
-## Clean article text
-Every source story gets a final sanitation pass before it is written into the paper. The sanitizer:
-- decodes double-encoded RSS/HTML,
-- removes HTML/XML tags,
-- removes `href` fragments and raw attributes,
-- strips giant/tracking URLs from article text,
-- removes common newsletter, “continue reading”, image-caption and page-boilerplate lines,
-- preserves paragraph breaks where possible,
-- refuses to label malformed page output as a full article.
-
-If a publisher blocks automated article fetching, Morning Paper shows a **clean feed excerpt** instead of raw markup. If even the feed excerpt is unusable, it shows a short source-link-only notice rather than pages of HTML or tracking links.
-
-This does not bypass subscriptions, logins, bot protection, or paywalls.
-
-## Automatic morning delivery
-Morning Paper can build itself before you wake up.
-
-- Automatic morning delivery uses KOReader's hardware wake scheduler when supported.
-- Delivery presets run from **5:30 AM through 8:00 AM**; default is **6:30 AM**.
-- Automatic delivery is opt-in.
-- The plugin attempts to bring Wi-Fi online, builds the dated EPUB silently, then turns Wi-Fi back off if it was originally off.
-- The status screen shows the next scheduled wake and the last delivery result.
-- Stories are sorted **newest → oldest within each section**.
-- Publisher timestamps are intentionally preserved as supplied, so GMT/UTC dates can appear a day ahead of local time.
-
-### Enable automatic delivery
-After updating and restarting KOReader:
-
-**Tools → Morning Paper → Automatic delivery → Enable automatic delivery**
-
-Then choose a delivery time. The default is **6:30 AM**.
-
-For fully unattended Wi-Fi startup, KOReader's Wi-Fi action must allow Wi-Fi to turn on automatically.
-
-## How the paper is built
-For each ordinary source story Morning Paper:
-1. pulls the current RSS/Atom entry,
-2. filters stale dated entries,
-3. follows the article link,
-4. attempts to extract the publicly available article body,
-5. sanitizes the extracted body,
-6. falls back to a sanitized publisher RSS excerpt when full text cannot be extracted,
-7. shows only a source-link notice if no clean text remains,
-8. sorts the section newest-first.
-
-If AI Intelligence Desk is enabled, Morning Paper then:
-9. gathers short excerpts from the accessible reporting,
-10. gathers fresh WSJ agenda-only headline signals,
-11. makes one multi-source synthesis request,
-12. inserts the Intelligence Desk before the ordinary sections,
-13. packages the cover, table of contents, metadata, synthesis and source stories into one EPUB.
-
-## Default sections
-- Intelligence Desk (when AI is enabled and available)
 - Front Page
 - World
 - U.S.
@@ -117,32 +47,146 @@ If AI Intelligence Desk is enabled, Morning Paper then:
 - Technology & AI
 - Science
 - Culture
+- Sources & Further Reading
 
-## Install / update
-If installed through the KOReader community App Store:
-1. Refresh the App Store.
-2. Update/reinstall Morning Paper.
-3. Restart KOReader completely.
-4. Tap **Refresh today's paper** once to regenerate today's issue with the new code.
+The newsroom is generated **desk by desk** instead of relying on one huge AI response. Front Page performs a global editorial pass over the research packet; the remaining desks then publish the most consequential non-duplicate stories from their areas.
+
+With a large research packet the edition can produce roughly 8–14 original stories, depending on what the day's reporting supports and which desk calls succeed.
+
+If the newsroom produces too few usable stories to resemble a real newspaper, Morning Paper refuses to pretend the run succeeded and falls back to the transparent source-article edition instead.
+
+## Better table of contents
+
+v0.7 separates the article's display headline from its navigation headline.
+
+Every AI story can have:
+
+- a full newspaper headline,
+- a short 4–9 word **TOC headline**,
+- a one-sentence dek,
+- the full article body.
+
+Both EPUB3 navigation and the legacy NCX table of contents now support nested entries:
+
+**Section → concise story headline**
+
+This keeps the TOC useful on a small e-ink screen instead of trying to squeeze a long sentence into each row.
+
+The source appendix intentionally stays as one TOC section rather than expanding dozens of research references into the main navigation.
+
+## Cleaner source appendix
+
+The underlying reporting is still available for transparency, but it no longer takes over the newspaper.
+
+**Sources & Further Reading** groups compact source references by research desk and includes the source headline, outlet, publication time and original link when available.
+
+WSJ entries are clearly marked as public agenda/headline signals. Morning Paper does not access, reconstruct or bypass subscriber-only WSJ article text.
+
+## AI model controls
+
+Go to:
+
+**Tools → Morning Paper → AI Newsroom → Model**
+
+Options include:
+
+- **Follow KOAssistant** — mirror KOAssistant's current model when it can be resolved,
+- **Claude Sonnet 5** — `anthropic/claude-sonnet-5`,
+- **OpenRouter Free** — `openrouter/free`,
+- **Custom OpenRouter model…**
+
+The AI status screen now shows both the configured choice and the **effective model** that will actually be requested.
+
+Morning Paper first tries its own saved OpenRouter key. If none is set, it tries to reuse an OpenRouter key already configured in KOAssistant.
+
+Because v0.7 runs separate newsroom desks, a full edition can use several AI requests instead of the old single-request design. This improves reliability and section coverage but can cost more when a paid model is selected. When OpenRouter returns cost metadata, Morning Paper records and displays the reported edition cost.
+
+## Front Page selection
+
+Front Page is now a real editorial selection pass over the entire research packet rather than simply inheriting the first feed's ordering.
+
+The newsroom is instructed to prioritize consequential developments such as governance, elections, security, diplomacy, the economy, markets, major companies, technology, public safety and institutions. Novelty or entertainment stories should not displace more consequential developments when stronger news is available.
+
+A stable story key is generated for every article so later desks can avoid republishing the same event.
+
+## Source mix
+
+The default research pool includes BBC, The Guardian, Fox News, The Epoch Times, Ars Technica and primary economic sources including the Federal Reserve and Bureau of Labor Statistics.
+
+Public WSJ RSS feeds for World News, U.S. Business, Markets, Technology/What's News, Opinion and Lifestyle are used only as agenda/topic signals. Stale feed entries are filtered automatically.
+
+## Clean article extraction
+
+Every accessible source story gets a final sanitation pass before it enters the newsroom research packet. The sanitizer:
+
+- decodes double-encoded RSS/HTML,
+- removes HTML/XML tags,
+- removes `href` fragments and raw attributes,
+- strips giant/tracking URLs,
+- removes common newsletter, “continue reading”, image-caption and page-boilerplate lines,
+- preserves paragraph breaks where possible,
+- refuses to label malformed page output as a full article.
+
+If a publisher blocks automated article fetching, Morning Paper uses a clean feed excerpt instead. If even the excerpt is unusable, the research item becomes source-link-only.
+
+Morning Paper does not bypass subscriptions, logins, bot protection or paywalls.
+
+## Automatic morning delivery
+
+Morning Paper can build itself before you wake up.
+
+- Automatic delivery uses KOReader's hardware wake scheduler when supported.
+- Delivery presets run from **5:30 AM through 8:00 AM**; default is **6:30 AM**.
+- Automatic delivery is opt-in.
+- The plugin attempts to bring Wi-Fi online, builds the dated EPUB silently, then turns Wi-Fi back off if it was originally off.
+- The status screen shows the next scheduled wake and the last delivery result.
+- Publisher timestamps remain as supplied, including GMT/UTC dates that may appear a day ahead of local time.
+
+Enable it at:
+
+**Tools → Morning Paper → Automatic delivery → Enable automatic delivery**
+
+For fully unattended Wi-Fi startup, KOReader's Wi-Fi action must allow Wi-Fi to turn on automatically.
+
+## EPUB editions and covers
 
 Generated issues are stored in:
 
 `/mnt/us/documents/Morning Paper/`
 
-## Article labels
-Ordinary source stories may be labeled:
-- **Full article** — a clean public article body was extracted.
-- **Feed excerpt** — the publisher blocked/limited page extraction, so a sanitized feed excerpt is shown.
-- **Source link only** — neither the article page nor the feed supplied enough clean readable text.
+and named like:
 
-Intelligence Desk stories are labeled **AI multi-source synthesis** and list the source names the model says it used.
+`Morning Paper 2026-08-12.epub`
+
+Every issue gets a dynamically generated black-and-white newspaper cover containing the issue date, edition time and leading headlines. AI editions show the number of original Morning Paper stories and the number of source reports researched.
+
+Opening a generated paper uses KOReader's normal reader switch path so launcher overlays such as Bookshelf are not deliberately closed first.
+
+## Install / update
+
+If installed through the KOReader community App Store:
+
+1. Refresh the App Store.
+2. Update/reinstall Morning Paper.
+3. Restart KOReader completely.
+4. For the first v0.7 test, choose **AI Newsroom → Model → Claude Sonnet 5** if you want to guarantee that model rather than relying on automatic model detection.
+5. Tap **Refresh today's paper** once to regenerate today's issue with the new newsroom.
+
+## Failure behavior
+
+Morning Paper never silently treats a one-story AI result as a successful full edition.
+
+For a substantial research packet, v0.7 enforces a minimum number of original newsroom stories. If too few usable stories survive, the AI newsroom run is considered unsuccessful and the plugin publishes the transparent direct-source fallback instead. The completion dialog explains what happened.
+
+Desk-level warnings do not necessarily destroy an otherwise healthy edition: successful desks are kept as long as the paper still clears the minimum full-edition threshold.
 
 ## Current limitations
-- AI synthesis can make mistakes; the underlying source stories remain in the issue for verification.
-- The free OpenRouter router can vary in model quality/availability from one run to another.
+
+- AI synthesis can make mistakes; the source appendix is there to make the research trail inspectable.
 - Article extraction is best-effort because publisher HTML changes over time.
 - JavaScript-only sites, bot protection, logins and subscriptions can prevent full-text extraction.
-- WSJ agenda feeds are legacy public RSS endpoints and may occasionally be stale; stale entries are automatically ignored.
+- Free-router model quality and availability can vary from run to run.
+- v0.7's desk-by-desk newsroom uses more requests than the previous single-call design, so paid-model cost can be higher.
 - Scheduled hardware wake and unattended Wi-Fi behavior vary by Kindle/e-reader model and need real-device testing.
 - EPUB cover-thumbnail behavior can depend on KOReader's cover cache.
 - No on-device per-source editor yet.
