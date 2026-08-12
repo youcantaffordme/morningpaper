@@ -1,10 +1,16 @@
 -- Morning Paper v0.8 Coverage Net
 --
--- This module does not bypass paywalls. It makes better use of public RSS
--- headlines/summaries as editorial leads, then promotes corroborating PUBLIC
--- reporting about the same topic into the newsroom packet. The finished story
--- is still written only from evidence Morning Paper actually received.
-local CoverageNet = {}
+-- Keep the proven v0.7 newsroom module as the object main_v07 receives, and
+-- enhance its generate() method in place. This avoids swapping package.loaded
+-- entries during plugin startup, which proved fragile on KOReader.
+--
+-- Coverage Net never bypasses a paywall. Public RSS headlines/summaries are
+-- editorial leads and limited evidence only. The actual Morning Paper story is
+-- written from public material the plugin really received, preferably
+-- corroborated across multiple independent sources.
+
+local Base = require("newsroom_v07")
+local base_generate = Base.generate
 
 local function clean(s)
     return tostring(s or ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
@@ -54,8 +60,7 @@ local function agenda_section(item)
     if category == "World News" then return "World" end
     if category == "U.S. Business" or category == "Markets" then return "Business & Markets" end
     if category:find("Technology", 1, true) then return "Technology & AI" end
-    -- Opinion is useful to understand agenda/framing, but not promoted as a
-    -- factual evidence desk. Lifestyle stays an agenda signal too.
+    -- Opinion/lifestyle stay agenda signals rather than factual evidence.
     return nil
 end
 
@@ -136,29 +141,23 @@ local function promote_correlated_public_reports(sections, original_sections, ag
     return promoted
 end
 
-function CoverageNet.wrap(Base)
-    local Newsroom = {}
-    for k, v in pairs(Base or {}) do Newsroom[k] = v end
+-- Patch the SAME newsroom table main_v07 already knows how to use.
+function Base.generate(opts)
+    opts = opts or {}
+    local original = opts.sections or {}
+    local expanded = clone_sections(original)
+    local summary_count = add_public_feed_summaries(expanded, opts.agenda_items or {})
+    local promoted_count = promote_correlated_public_reports(expanded, original, opts.agenda_items or {})
 
-    function Newsroom.generate(opts)
-        opts = opts or {}
-        local original = opts.sections or {}
-        local expanded = clone_sections(original)
-        local summary_count = add_public_feed_summaries(expanded, opts.agenda_items or {})
-        local promoted_count = promote_correlated_public_reports(expanded, original, opts.agenda_items or {})
+    local forwarded = {}
+    for k, v in pairs(opts) do forwarded[k] = v end
+    forwarded.sections = expanded
 
-        local forwarded = {}
-        for k, v in pairs(opts) do forwarded[k] = v end
-        forwarded.sections = expanded
-
-        local output, err, model, count, stats = Base.generate(forwarded)
-        stats = stats or {}
-        stats.public_rss_evidence = summary_count
-        stats.agenda_correlations = promoted_count
-        return output, err, model, count, stats
-    end
-
-    return Newsroom
+    local output, err, model, count, stats = base_generate(forwarded)
+    stats = stats or {}
+    stats.public_rss_evidence = summary_count
+    stats.agenda_correlations = promoted_count
+    return output, err, model, count, stats
 end
 
-return CoverageNet
+return Base
