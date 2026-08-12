@@ -24,8 +24,6 @@ end
 
 -- Prefer a Morning Paper key if the user explicitly saved one. Otherwise, try
 -- to reuse an OpenRouter key the reader already configured for KOAssistant.
--- The key never leaves the device except as the Authorization header sent to
--- OpenRouter for the requested synthesis.
 function AiBriefing.findOpenRouterKey(explicit_key)
     if nonempty(explicit_key) then return explicit_key, "Morning Paper settings" end
 
@@ -166,37 +164,120 @@ Editorial standard:
 - Write clean original prose. Do not reproduce source wording and do not quote more than eight consecutive words from any source.
 - Be concise enough for a morning read but substantial enough that the reader understands the issue without opening five articles.
 
-Return ONLY a valid JSON array with 5 to 8 objects. Each object must have exactly:
-{
-  "title": "an original concise headline",
-  "body": "FACTS: ...\n\nWHY IT MATTERS: ...\n\nWHERE COVERAGE DIFFERS: ...\n\nWATCH NEXT: ...",
-  "sources": ["Source name", "Source name"]
-}
+Return a JSON object with one key named "briefs". "briefs" must contain 1 to 8 objects. Every brief must contain exactly:
+- "title": an original concise headline
+- "body": prose formatted as FACTS, WHY IT MATTERS, WHERE COVERAGE DIFFERS, and WATCH NEXT
+- "sources": an array of source names actually used
 
-If the reporting does not support 5 responsible multi-source briefs, return fewer rather than inventing material.
+If the reporting does not support five responsible multi-source briefs, return fewer rather than inventing material.
 ]]
 
-local function extract_json_array(text)
-    if type(text) ~= "string" then return nil end
-    local first = text:find("[", 1, true)
-    local last
-    for i = #text, 1, -1 do
-        if text:sub(i, i) == "]" then last = i break end
+local RESPONSE_FORMAT = {
+    type = "json_schema",
+    json_schema = {
+        name = "morning_paper_intelligence",
+        strict = true,
+        schema = {
+            type = "object",
+            properties = {
+                briefs = {
+                    type = "array",
+                    minItems = 1,
+                    maxItems = 8,
+                    items = {
+                        type = "object",
+                        properties = {
+                            title = { type = "string" },
+                            body = { type = "string" },
+                            sources = {
+                                type = "array",
+                                items = { type = "string" },
+                            },
+                        },
+                        required = { "title", "body", "sources" },
+                        additionalProperties = false,
+                    },
+                },
+            },
+            required = { "briefs" },
+            additionalProperties = false,
+        },
+    },
+}
+
+local function as_brief_array(value)
+    if type(value) ~= "table" then return nil end
+    if type(value.briefs) == "table" then return value.briefs end
+    if type(value.articles) == "table" then return value.articles end
+    if type(value.items) == "table" then return value.items end
+    if #value > 0 then return value end
+    return nil
+end
+
+local function try_decode(text)
+    if type(text) ~= "string" or text == "" then return nil end
+    local ok, decoded = pcall(rapidjson.decode, text)
+    if ok then
+        local briefs = as_brief_array(decoded)
+        if briefs then return briefs end
     end
-    if not first or not last or last < first then return nil end
-    return text:sub(first, last)
+    return nil
+end
+
+-- Structured outputs should make the first decode succeed. These fallbacks keep
+-- Morning Paper resilient to providers that still wrap JSON in prose/code fences.
+local function decode_briefs(text)
+    if type(text) ~= "string" then return nil end
+
+    local briefs = try_decode(text)
+    if briefs then return briefs end
+
+    local stripped = text
+        :gsub("^%s*```[%w_%-]*%s*", "")
+        :gsub("%s*```%s*$", "")
+    briefs = try_decode(stripped)
+    if briefs then return briefs end
+
+    local first_obj = stripped:find("{", 1, true)
+    local last_obj
+    for i = #stripped, 1, -1 do
+        if stripped:sub(i, i) == "}" then last_obj = i break end
+    end
+    if first_obj and last_obj and last_obj >= first_obj then
+        briefs = try_decode(stripped:sub(first_obj, last_obj))
+        if briefs then return briefs end
+    end
+
+    local first_arr = stripped:find("[", 1, true)
+    local last_arr
+    for i = #stripped, 1, -1 do
+        if stripped:sub(i, i) == "]" then last_arr = i break end
+    end
+    if first_arr and last_arr and last_arr >= first_arr then
+        briefs = try_decode(stripped:sub(first_arr, last_arr))
+        if briefs then return briefs end
+    end
+
+    return nil
 end
 
 local function make_request(api_key, model, user_prompt)
     local body = {
         model = model or DEFAULT_MODEL,
-        temperature = 0.2,
-        max_tokens = 3600,
+        max_tokens = 6000,
         messages = {
             { role = "system", content = SYSTEM_PROMPT },
             { role = "user", content = user_prompt },
         },
+        response_format = RESPONSE_FORMAT,
+        plugins = {
+            { id = "response-healing" },
+        },
     }
+
+    -- Claude 5 models reject sampling controls on some providers. The editorial
+    -- prompt + strict JSON schema already make this request deterministic enough,
+    -- so Morning Paper deliberately sends no temperature/top_p parameters.
 
     local encoded, encode_err = rapidjson.encode(body)
     if not encoded then return nil, "Could not encode AI request: " .. tostring(encode_err) end
@@ -220,7 +301,7 @@ local function make_request(api_key, model, user_prompt)
     code = tonumber(code) or 0
     local raw = table.concat(sink)
     if code < 200 or code >= 300 then
-        local detail = raw ~= "" and clip(raw, 300) or tostring(status or code or "network error")
+        local detail = raw ~= "" and clip(raw, 420) or tostring(status or code or "network error")
         return nil, "OpenRouter request failed: " .. detail
     end
 
@@ -229,7 +310,7 @@ local function make_request(api_key, model, user_prompt)
     local choice = response.choices and response.choices[1]
     local content = choice and choice.message and choice.message.content
     if type(content) ~= "string" or content == "" then return nil, "OpenRouter returned no briefing text" end
-    return content, nil, response.model
+    return content, nil, response.model, choice.finish_reason
 end
 
 function AiBriefing.generate(opts)
@@ -259,13 +340,16 @@ Create the Intelligence Desk now.]],
     )
 
     local selected_model = AiBriefing.resolveModel(opts.model)
-    local content, err, model_used = make_request(api_key, selected_model, user_prompt)
+    local content, err, model_used, finish_reason = make_request(api_key, selected_model, user_prompt)
     if not content then return nil, err end
 
-    local json_text = extract_json_array(content)
-    if not json_text then return nil, "AI response was not a JSON briefing array" end
-    local decoded, json_err = rapidjson.decode(json_text)
-    if type(decoded) ~= "table" then return nil, "Could not parse AI briefing: " .. tostring(json_err) end
+    local decoded = decode_briefs(content)
+    if type(decoded) ~= "table" then
+        if finish_reason == "length" then
+            return nil, "AI briefing was truncated before the structured response completed"
+        end
+        return nil, "AI returned an unusable structured briefing response"
+    end
 
     local out = {}
     for _, brief in ipairs(decoded) do
@@ -276,15 +360,15 @@ Create the Intelligence Desk now.]],
                     if nonempty(source) then sources[#sources + 1] = tostring(source) end
                 end
             end
-            local body = tostring(brief.body)
-            if #sources > 0 then body = body .. "\n\nSOURCES: " .. table.concat(sources, "; ") end
+            local body_text = tostring(brief.body)
+            if #sources > 0 then body_text = body_text .. "\n\nSOURCES: " .. table.concat(sources, "; ") end
             out[#out + 1] = {
                 title = tostring(brief.title),
                 source = "Morning Paper Intelligence Desk",
                 date = os.date("%a, %d %b %Y %H:%M:%S %z"),
                 published_epoch = os.time(),
                 content_mode = "AI multi-source synthesis · " .. tostring(model_used or selected_model or DEFAULT_MODEL),
-                body = body,
+                body = body_text,
                 link = "",
             }
             if #out >= 8 then break end
@@ -295,9 +379,8 @@ Create the Intelligence Desk now.]],
     return out, nil, model_used or selected_model
 end
 
--- v0.5.1 migration: if Morning Paper is still on the original free-router default
--- and KOAssistant is currently using OpenRouter, mirror KOAssistant's model so the
--- status screen and next paper immediately reflect the reader's chosen model.
+-- Migration: if Morning Paper is still on the original free-router default and
+-- KOAssistant is currently using OpenRouter, mirror KOAssistant's chosen model.
 if G_reader_settings then
     local current = G_reader_settings:readSetting("morningpaper_ai_model", DEFAULT_MODEL)
     if not nonempty(current) or current == DEFAULT_MODEL then
