@@ -1,4 +1,4 @@
--- Morning Paper v0.12.2 — direct runtime wiring
+-- Morning Paper v0.12.3 — direct runtime wiring
 --
 -- This entrypoint deliberately mutates the proven main_v07 class in-place.
 -- KOReader executes this file with dofile(), so every runtime-facing override
@@ -9,7 +9,7 @@ local InfoMessage = require("ui/widget/infomessage")
 local Device = require("device")
 local _ = require("gettext")
 
-local RUNTIME_BUILD = "0.12.2"
+local RUNTIME_BUILD = "0.12.3"
 
 -- Expand the research pool once, without duplicating sources if KOReader ever
 -- reloads the entrypoint in the same process.
