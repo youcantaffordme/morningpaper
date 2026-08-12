@@ -2,6 +2,6 @@ local _ = require("gettext")
 return {
     name = "morningpaper",
     fullname = _("Morning Paper"),
-    description = _("Build a clean, source-attributed daily EPUB newspaper with a dated front-page cover and optional automatic morning delivery."),
-    version = "0.4.2",
+    description = _("Build an automatically delivered EPUB newspaper with clean source articles, a dated cover, and an optional multi-source AI Intelligence Desk."),
+    version = "0.5.0",
 }
