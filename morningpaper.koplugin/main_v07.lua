@@ -1,4 +1,4 @@
--- Morning Paper v0.12.4 compatibility runtime.
+-- Morning Paper v0.12.5 compatibility runtime.
 --
 -- IMPORTANT: this is intentionally the file older Morning Paper entrypoints
 -- already require. The proven v0.7 implementation lives in main_core_v07.lua;
@@ -10,7 +10,7 @@ local InfoMessage = require("ui/widget/infomessage")
 local Device = require("device")
 local _ = require("gettext")
 
-local RUNTIME_BUILD = "0.12.4"
+local RUNTIME_BUILD = "0.12.5"
 
 -- Load the current newsroom stack BEFORE the old core captures newsroom_v07.
 -- newsroom_v12 ultimately mutates/returns the same base newsroom table, so the
